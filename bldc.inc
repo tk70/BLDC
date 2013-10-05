@@ -9,12 +9,12 @@
 
 .equ ZC_FILTERING = 1					; filter ZC? 0 - no filtering, 1- filtering
 
-.equ TIMING_ADVANCE = 13				; [0-128] -> [0°-30°]. motor timing advance
+.equ TIMING_ADVANCE = 0					; [0-128] -> [0°-30°]. motor timing advance
 							; 0->no advance, ..., 64->15°, ..., 128->30° advance etc
 .equ ACTIVE_FREEWHEELING = 0				; aka complementary PWM
 
 .equ GOVERNOR_MODE = 0
-.equ GOVERNOR_MAX_RPM = 50000
+.equ GOVERNOR_MAX_RPM = 40000
 
 .equ GOV_I_FACTOR = 2
 

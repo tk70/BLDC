@@ -48,39 +48,17 @@
 
 .equ T_COMP_CHANNEL	= 2
 
-.equ LED_DBG = 0
+.equ LED_DEBUG = 1
 
 ; for debug
-/*
-.equ LED0_DDR	=	DDRC
-.equ LED0_PORT	=	PORTC
-.equ LED0_PIN	=	PC3
+.equ LED0_DDR	=	DDRB
+.equ LED0_PORT	=	PORTB
+.equ LED0_PIN	=	PB3
 
-.equ LED1_DDR	=	DDRC
-.equ LED1_PORT	=	PORTC
-.equ LED1_PIN	=	PC4
+.equ LED1_DDR	=	DDRB
+.equ LED1_PORT	=	PORTB
+.equ LED1_PIN	=	PB4
 
-.equ LED2_DDR	=	DDRD
-.equ LED2_PORT	=	PORTD
-.equ LED2_PIN	=	PD5
-
-.equ LED3_DDR	=	DDRD
-.equ LED3_PORT	=	PORTD
-.equ LED3_PIN	=	PD4
-
-.equ LED4_DDR	=	DDRD
-.equ LED4_PORT	=	PORTD
-.equ LED4_PIN	=	PD3
-
-.equ LED5_DDR	=	DDRC
-.equ LED5_PORT	=	PORTC
-.equ LED5_PIN	=	PC5
-
-.equ LED6_DDR	=	DDRD
-.equ LED6_PORT	=	PORTD
-.equ LED6_PIN	=	PD1
-
-.equ LED7_DDR	=	DDRD
-.equ LED7_PORT	=	PORTD
-.equ LED7_PIN	=	PD0
-*/
+.equ LED5_DDR	=	DDRB
+.equ LED5_PORT	=	PORTB
+.equ LED5_PIN	=	PB3

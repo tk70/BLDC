@@ -15,8 +15,6 @@
 .equ TICKS_PER_US = CLOCK_MHZ/TIMER_PRESCALER
 .equ TICKS_PER_MS = TICKS_PER_US * 1000
 .equ TICKS_PER_SEC = TICKS_PER_MS * 1000
-.equ US_PER_16_OVERFLOW = $FFFF / TICKS_PER_US
-.equ US_PER_24_OVERFLOW = $FFFFFF / TICKS_PER_US
 
 .equ COM_T_RPM_MIN = 1000000*10*TICKS_PER_US/MIN_RPM
 .equ COM_T_RPM_MAX = 1000000*10*TICKS_PER_US/MAX_RPM
@@ -35,18 +33,6 @@
 .equ STARTUP_MIN_POWER_L = low(STARTUP_MIN_POWER*TICKS_PER_US)
 .equ STARTUP_MIN_POWER_H = high(STARTUP_MIN_POWER*TICKS_PER_US)
 .equ STARTUP_COM_TIMEOUT = 1000000*10*TICKS_PER_US/STARTUP_MIN_RPM
-
-;.equ STARTUP_STABIL_POWER_L = low(STARTUP_STABIL_POWER*TICKS_PER_US)
-;.equ STARTUP_STABIL_POWER_H = high(STARTUP_STABIL_POWER*TICKS_PER_US)
-;.equ STARTUP_STABIL_HALF_POW = STARTUP_STABIL_POWER*TICKS_PER_US/2
-;.equ STARTUP_STABIL_HALF_POW_L = low(STARTUP_STABIL_HALF_POW)
-;;.equ STARTUP_STABIL_HALF_POW_H = high(STARTUP_STABIL_HALF_POW)
-;.equ STARTUP_STABIL_T_US = STARTUP_STABIL_TIME*1000
-;.equ STARTUP_STABIL_TIME_L = byte1(STARTUP_STABIL_T_US*TICKS_PER_US)
-;.equ STARTUP_STABIL_TIME_H = byte2(STARTUP_STABIL_T_US*TICKS_PER_US)
-;.equ STARTUP_STABIL_TIME_E = byte3(STARTUP_STABIL_T_US*TICKS_PER_US)
-;.equ SSP_DEC_STEP = STARTUP_STABIL_HALF_POW*US_PER_16_OVERFLOW/STARTUP_STABIL_T_US
-//STARTUP_STABIL_HALF_POW / (STARTUP_STABIL_T_US / US_PER_16_OVERFLOW)
 
 .equ COM_DELAY = 128 - TIMING_ADVANCE
 
@@ -71,22 +57,20 @@
 ; Beeper on state in one cycle time [us]
 .equ BEEP_ON_TIME = 20
 
-; Beeper sound frequencies
-.equ BPF_C5 = 523
-.equ BPF_D5 = 587
-.equ BPF_E5 = 659
-.equ BPF_F5 = 698
-.equ BPF_G5 = 784
-.equ BPF_A5 = 880
-.equ BPF_H5 = 988
-.equ BPF_C6 = 1047
-.equ BPF_D6 = 1175
-.equ BPF_E6 = 1319
-.equ BPF_F6 = 1397
-.equ BPF_G6 = 1568
-.equ BPF_A6 = 1760
-.equ BPF_H6 = 1976
-.equ BPF_C7 = 2093
+; Beeper sound frequencies [Hz]
+.equ BPF_C6 =	1047
+.equ BPF_Db6 =	1108
+.equ BPF_D6 =	1175
+.equ BPF_Eb6 =	1245
+.equ BPF_E6 =	1319
+.equ BPF_F6 =	1397
+.equ BPF_Gb6 =	1480
+.equ BPF_G6 =	1568
+.equ BPF_Ab6 =	1661
+.equ BPF_A6 =	1760
+.equ BPF_Hb6 =	1856
+.equ BPF_H6 =	1976
+.equ BPF_C7 =	2093
 
 ; *------------------*
 ; |     Registers    |
@@ -218,14 +202,61 @@ stloop:		nop
 ; |      General     |
 ; *------------------*
 
-.macro	flash_led
-	.if	LED_DBG
+.macro flash_led
 		push	XL
 		ldi	XL, 0
 		out	TCNT2, XL
-		sbi	LED2_PORT, LED2_PIN
+		led_dbg	2, 1
 		pop	XL
-	.endif
+.endmacro
+
+.macro set_pin	.if @2					; if high state
+		 sbi	@0, @1
+		.else
+		 cbi	@0, @1
+		.endif
+.endmacro
+
+; args: led number, state (0/1)
+.macro led	.if @0 == 0
+		 .ifdef LED0_PORT
+		  set_pin	LED0_PORT, LED0_PIN, @1
+		 .endif
+		.elif @0 == 1
+		 .ifdef LED1_PORT
+		  set_pin	LED1_PORT, LED1_PIN, @1
+		 .endif
+		.elif @0 == 2
+		 .ifdef LED2_PORT
+		  set_pin	LED2_PORT, LED2_PIN, @1
+		 .endif
+		.elif @0 == 3
+		 .ifdef LED3_PORT
+		  set_pin	LED3_PORT, LED3_PIN, @1
+		 .endif
+		.elif @0 == 4
+		 .ifdef LED4_PORT
+		  set_pin	LED4_PORT, LED4_PIN, @1
+		 .endif
+		.elif @0 == 5
+		 .ifdef LED5_PORT
+		  set_pin	LED5_PORT, LED5_PIN, @1
+		 .endif
+		.elif @0 == 6
+		 .ifdef LED6_PORT
+		  set_pin	LED6_PORT, LED6_PIN, @1
+		 .endif
+		.elif @0 == 7
+		 .ifdef LED7_PORT
+		  set_pin	LED7_PORT, LED7_PIN, @1
+		 .endif
+		.endif
+.endmacro
+
+; same as above, but checks if led debug is enabled
+.macro led_dbg	.if LED_DEBUG
+		 led @0, @1
+		.endif
 .endmacro
 
 reset_vars:	clr	rcp_fail_count
@@ -261,7 +292,7 @@ rv_clear_loop:	st	X+, DL			; clear ram variables
 ; why not make it prescaler free. Entire clock cycle will take above one second to complete, which is more than enough.
 ; Speaking of 16MHz crystal here.
 ; The extended timer byte called ocr1ae here, is stored in RAM. It's not like the first two bytes though, it's more like
-; ocr1a multiplier. Thanks to this approach, "tcnt1e" doesn't have to be used and stored aswell.
+; ocr1a multiplier
 
 ; Read the 24 bit timer value.
 ; We read timer1 value, extended byte stored in RAM [1] and check if timer1 overflow occured during the operation [2].
@@ -363,22 +394,22 @@ ts_ret:		sei					; no. enable interrupts.
 timer_set_relative:
 		ldi	YH, 1<<OCF1A
 		cli
-		in	DL, TCNT1L							
+		in	DL, TCNT1L			; read current time (16 bit timer1)	
 		in	DH, TCNT1H
-		add	DL, XL
+		add	DL, XL				; increment by time to wait
 		adc	DH, XH
-		out	OCR1AH, DH
+		out	OCR1AH, DH			; out it
 		out	OCR1AL, DL
-		out	TIFR, YH
+		out	TIFR, YH			; clear interrupt flag just in case interrupt is waiting
 		cbr	flags, 1<<TIMER_READY
-		sts	ocr1ae, YL
+		sts	ocr1ae, YL			; store the extended byte
 		sei
 		ret
 
 
 ; Timer1 compare interrupt A
 ; Activates when timer reaches set value
-; If specified, may call a function. The function
+; If specified, may call a commutation function
 timer_int_ocr1a:
 		in	IL, SREG
 		lds	IH, ocr1ae
@@ -414,9 +445,7 @@ timer_int_t1ovf:
 
 ; Timer2 overflow interrupt
 t2_ovf:		in	IL, SREG
-		.if	LED_DBG
-		  cbi	LED2_PORT, LED2_PIN
-		.endif
+		led_dbg	2, 0
 		out	SREG, IL
 		reti
 
@@ -436,9 +465,7 @@ delay_8cycles:	sbiw	XL, 1				; 2
 rcp_int:	in	IL, SREG
 		sbic	RCP_PIN_REG, RCP_PIN		; is it low or high state?
 		rjmp	rcp_rcp_high_state
-		.if	LED_DBG
-		  cbi	LED4_PORT, LED4_PIN
-		.endif
+		led_dbg	4, 0
 		sbrs	flags2, RCP_AWAITING_L		; check if we are waiting for a falling edge
 		rjmp	ret_i				; no, return
 		in	JL, TCNT1L			; yes, calculate length of the impulse
@@ -476,9 +503,6 @@ rcp_rcp_fail2:	ldi	JL, 3
 		out	SREG, IL
 		reti
 rcp_invalid_signal:
-		.if	LED_DBG
-		  sbi	LED1_PORT, LED1_PIN
-		.endif
 		clr	rcp_fail_count
 		sbr	flags2, (1<<SIGNAL_READY) | (1<<SIGNAL_ERROR)
 		cbr	flags2, 1<<RCP_AWAITING_L
@@ -489,9 +513,7 @@ rcp_no_power:	clr	JL
 		reti
 rcp_rcp_high_state:					; rising edge detected. start measuring how long it is
 		sbr	flags2, 1<<RCP_CHECK_TIMEOUT
-		.if		LED_DBG
-		  sbi	LED4_PORT, LED4_PIN
-		.endif
+		led_dbg	4, 1
 		sbr	flags2, 1<<RCP_AWAITING_L	; mark that we are waiting for low state now
 		in	rcp_time_l, TCNT1L
 		in	rcp_time_h, TCNT1H
@@ -503,8 +525,7 @@ rcp_rcp_high_state:					; rising edge detected. start measuring how long it is
 ; Parse the power value incoming from RCP/I2C
 ; In case of RCP, limit the pulse length to the power range
 ; Returns power value in XH:XL
-update_power:
-		cbr	flags2, 1<<SIGNAL_READY
+update_power:	cbr	flags2, 1<<SIGNAL_READY
 		cli					; cli, we don't want the rcp_int interrupt between these two lines
 		lds	XL, rcp_power_factor_l		; read length of the pulse
 		lds	XH, rcp_power_factor_h
@@ -628,8 +649,7 @@ fet_delay:	nop
 		ret
 
 ; cuts the power off, all power FETs closed
-motor_free_run:	reti 
-rcall	sdm_off				; sdm generator off, so it doesn't open the FETs
+motor_free_run:	rcall	sdm_off				; sdm generator off, so it doesn't open the FETs
 		RY_off
 		SY_off		
 		TY_off
@@ -669,9 +689,7 @@ c0_low:		ldi		ZL, low(sdm_j0)		; set jump address for sdm generator
 		sts	next_comm_call_addr_l, JL
 		ldi	JL, high(commutation_01)
 		sts	next_comm_call_addr_h, JL
-		.if	LED_DBG
-		  cbi	LED1_PORT, LED1_PIN
-		.endif
+		led_dbg	1, 0
 		cbr	flags, 1<<AWAITED_ZC_TYPE	; next awaited ZC will be high to low
 		ret
 
@@ -691,9 +709,7 @@ c1_low:		ldi	ZL, low(sdm_j2)
 		sts	next_comm_call_addr_l, JL
 		ldi	JL, high(commutation_12)
 		sts	next_comm_call_addr_h, JL
-		.if	LED_DBG
-		  cbi	LED1_PORT, LED1_PIN
-		.endif
+		led_dbg	1, 0
 		sbr	flags, 1<<AWAITED_ZC_TYPE	; next awaited ZC will be low to high
 		ret
 
@@ -714,9 +730,7 @@ c2_low:		ldi		ZL, low(sdm_j2)
 		sts	next_comm_call_addr_l, JL
 		ldi	JL, high(commutation_23)
 		sts	next_comm_call_addr_h, JL
-		.if	LED_DBG
-		  cbi	LED1_PORT, LED1_PIN
-		.endif
+		led_dbg	1, 0
 		cbr	flags, 1<<AWAITED_ZC_TYPE
 		ret
 
@@ -736,10 +750,8 @@ c3_low:		ldi	ZL, low(sdm_j4)
 		sts	next_comm_call_addr_l, JL
 		ldi	JL, high(commutation_34)
 		sts	next_comm_call_addr_h, JL
-		.if	LED_DBG
-		 cbi	LED1_PORT, LED1_PIN
-		 sbi	LED6_PORT, LED6_PIN
-		.endif
+		led_dbg	1, 0
+		led_dbg	6, 1
 		sbr	flags, 1<<AWAITED_ZC_TYPE
 		ret
 
@@ -748,9 +760,7 @@ commutation_34:	ldi	JL, S_COMP_CHANNEL
 		out	ADMUX, JL
 		SY_off
 		TY_on
-		.if	LED_DBG
-		  cbi	LED1_PORT, LED1_PIN
-		.endif
+		led_dbg	1, 0
 ;		brtc	c4_low
 ;		.if ACTIVE_FREEWHEELING
 ;			RY_off
@@ -771,10 +781,8 @@ commutation_45:	ldi	JL, R_COMP_CHANNEL
 		out	ADMUX, JL
 		RX_off
 		;TY_on
-		.if	LED_DBG
-		  cbi	LED1_PORT, LED1_PIN
-		  cbi	LED6_PORT, LED6_PIN
-		.endif
+		led_dbg	1, 0
+		led_dbg	6, 0
 		.if ACTIVE_FREEWHEELING
 		  RY_off
 		.endif
@@ -804,16 +812,14 @@ commutate:	cli
 ; *--------------------------*
 
 ; Enable beep timer
+; args: YH:YL cycle time (1s/f). unmodified.
+; clobbered: XL, XH
 beep_on:	sbrs	flags, PWM_ACTIVE
 		rcall	motor_free_run			; all FETs off, SDM off
 		in	XL, TIMSK
 		sbr	XL, 1<<OCIE1B
 		out	TIMSK, XL
 		sbr	flags2, 1<<BEEPER
-		; go down to beep_make_sound
-
-; args: YH:YL cycle time
-beep_make_sound:
 		sts	beep_cycle_time_l, YL
 		sts	beep_cycle_time_h, YH
 bp_lp:		sbrs	flags2, BEEP_CYCLE		; wait for timer to give a signal for single cycle
@@ -822,17 +828,14 @@ bp_lp:		sbrs	flags2, BEEP_CYCLE		; wait for timer to give a signal for single cy
 		ldi	XL, low(BEEP_ON_TIME*TICKS_PER_US*TIMER_PRESCALER/8)
 		ldi	XH, high(BEEP_ON_TIME*TICKS_PER_US*TIMER_PRESCALER/8)
 		RX_on
-		SY_on
+		TY_on
 		rcall	delay_8cycles
 		RX_off
-		RY_off
+		TY_off
 		wdr
 bp_ct:		sbrs	flags, TIMER_READY		; check timer. if it's ready, break the loop
 		rjmp	bp_lp
-		; go down to beep_off
-
-; Disable beep timer
-beep_off:	in	XL, TIMSK
+		in	XL, TIMSK
 		cbr	XL, 1<<OCIE1B
 		out	TIMSK, XL
 		rcall	motor_free_run
@@ -841,11 +844,15 @@ beep_off:	in	XL, TIMSK
 		cbr	flags2, 1<<BEEPER
 		ret
 
-; args: time[ms], freq[hz]
+; args: time[ms], freq[hz]. If frequency given 0, DH:DL will be used
 .macro	beep_sound
 		run_timer	@0*TICKS_PER_MS		; set time length of the beep
-		ldi	YL, low(TICKS_PER_SEC/@1)	; set frequency
-		ldi	YH, high(TICKS_PER_SEC/@1)
+		.if	@1
+		  ldi	YL, low(TICKS_PER_SEC/@1)	; set frequency
+		  ldi	YH, high(TICKS_PER_SEC/@1)
+		.else
+		  movw	YL, DL
+		.endif
 		rcall	beep_on
 .endmacro
 
@@ -865,21 +872,73 @@ beep_int_ocr1b:	in	JE, SREG
 		out	SREG, JE
 		reti
 
-; Three sounds, ESC activation
-beep_1:		beep_sound 50,	BPF_C6
-		delay_wdr	16*TICKS_PER_MS
-		beep_sound 50,	BPF_E6
-		delay_wdr	16*TICKS_PER_MS
-		beep_sound 60,	BPF_G6
+; Separately, don't want to inline it a few times
+beep_delay_16:	delay_wdr 16*TICKS_PER_MS
 		ret
 
+; Three sounds, ESC power on.
+beep_po:	led	0, 1
+		led	1, 1
+		beep_sound 84,	BPF_C6
+		rcall	beep_delay_16
+		beep_sound 84,	BPF_E6
+		rcall	beep_delay_16
+		beep_sound 100,	BPF_G6
+		led	0, 0
+		led	1, 0
+		ret
+
+; Watchdog reset occured. Womp. womp. womp.
+beep_wdr:	led	0, 1
+		beep_sound 133,	(BPF_E6/4)
+		rcall	beep_delay_16
+		beep_sound 133,	(BPF_Eb6/4)
+		rcall	beep_delay_16
+		beep_sound 170,	(BPF_D6/4)
+		rcall	beep_delay_16
+		beep_sound 220,	(BPF_Db6/4)
+		rcall	beep_delay_16
+		beep_sound 400,	(BPF_C6/4)
+		led	0, 0
+		ret
+
+; Brown out reset
+beep_bo:	ldi	DL, low(BPF_Ab6)
+		ldi	DH, high(BPF_Ab6)
+		ldi	CL, high(BPF_Ab6/8)
+		led	0, 1
+bp_bo_loop:	beep_sound 20, 0
+		subi	DL, 40
+		sbci	DH, 0
+		cpi	DL, low(BPF_Ab6/8)
+		cpc	DH, CL
+		brsh	bp_bo_loop
+		led	0, 0
+		ret
+
+; External reset
+beep_extr:	led	1, 1
+		beep_sound 150,	BPF_A6/2
+		led	1, 0
+		delay_wdr 300*TICKS_PER_MS
+		led	1, 1
+		beep_sound 150,	BPF_A6/2
+		led	1, 0
+		ret
+
+; Unrecognized reset reason, no flag set.
+beep_single:	led	0, 1
+		beep_sound 166,	BPF_G6/4
+		led	0, 0
+		ret
+	
 ; *--------------------------*
 ; |   Sigma-delta modulator  |
 ; *--------------------------*
 ; Implementation of Sigma-delta modulator
 
 ; Activate the SDM generator
-sdm_on:		in		XH, TIMSK
+sdm_on:		in	XH, TIMSK
 		sbr	XH, 1<<TOIE0
 		sbr	flags, 1<<PWM_ACTIVE
 		cbr	flags, 1<<BRAKED
@@ -893,6 +952,7 @@ sdm_off:	in	XH, TIMSK
 		cbr	XH, 1<<TOIE0
 		cbr	flags, 1<<PWM_ACTIVE
 		out	TIMSK, XH
+		led_dbg	5, 0
 		ret
 
 ; Timer0 overflow interrupt
@@ -920,9 +980,7 @@ sdm_l0:	.if ACTIVE_FREEWHEELING				; set the low state
 	.else
 		SX_off
 	.endif
-	.if		LED_DBG
-		cbi	LED5_PORT, LED5_PIN
-	.endif
+		led_dbg	5, 0
 		out	SREG, IL
 		wdr
 		clt
@@ -933,9 +991,7 @@ sdm_h0:	.if ACTIVE_FREEWHEELING				; set the high pwm state
 		rcall	fet_delay
 	.endif
 		SX_on
-	.if		LED_DBG
-		sbi	LED5_PORT, LED5_PIN
-	.endif
+		led_dbg	5, 1
 		out	SREG, IL
 		set
 		reti
@@ -948,9 +1004,7 @@ sdm_l2:	.if ACTIVE_FREEWHEELING
 	.else
 		TX_off
 	.endif
-	.if	LED_DBG
-		cbi	LED5_PORT, LED5_PIN
-	.endif
+		led_dbg	5, 0
 		out	SREG, IL
 		wdr
 		clt
@@ -961,9 +1015,7 @@ sdm_h2:	.if ACTIVE_FREEWHEELING
 		rcall	fet_delay
 	.endif
 		TX_on
-	.if	LED_DBG
-		sbi	LED5_PORT, LED5_PIN
-	.endif
+		led_dbg	5, 1
 		out	SREG, IL
 		set
 		reti
@@ -978,9 +1030,7 @@ sdm_l4:	.if ACTIVE_FREEWHEELING
 	.else
 		RX_off
 	.endif
-	.if	LED_DBG
-		cbi	LED5_PORT, LED5_PIN
-	.endif
+		led_dbg	5, 0
 		out	SREG, IL
 		wdr
 		clt
@@ -991,9 +1041,7 @@ sdm_h4:	.if ACTIVE_FREEWHEELING
 		rcall	fet_delay
 	.endif
 		RX_on
-	.if	LED_DBG
-		sbi	LED5_PORT, LED5_PIN
-	.endif
+		led_dbg	5, 1
 		out	SREG, IL
 		set
 		reti
@@ -1093,8 +1141,9 @@ start_up_again:
 		lds	XL, startup_attempts
 		inc	XL
 		sts	startup_attempts, XL
-start_up:
-		cbr	flags, (1<<STARTUP) | (1<<RUN)
+start_up:	cbr	flags, (1<<STARTUP) | (1<<RUN)
+		; check reset reason
+
 		sbrs	flags, BRAKED
 		lds	XL, startup_attempts
 		push	XL
@@ -1102,10 +1151,8 @@ start_up:
 		rcall	reset_vars
 		pop	XL
 		sts	startup_attempts, XL	
-	.if		LED_DBG
-		cbi	LED7_PORT, LED7_PIN
-		cbi	LED1_PORT, LED1_PIN
-	.endif
+		led_dbg	1, 0
+		led_dbg	7, 0
 su_wait_for_rc_signal:					; wait for i2c/rc signal
 		wdr
 		sbrc	flags2, SIGNAL_ERROR
@@ -1116,15 +1163,9 @@ su_wait_for_rc_signal:					; wait for i2c/rc signal
 		rcall	update_power
 		adiw	XL, 0
 		breq	su_wait_for_rc_signal		; received signal to start?
+		led_dbg	1, 1
 		rcall	start_reset_counters
-	.if		LED_DBG
-		sbi	LED1_PORT, LED1_PIN
-	.endif
 		sbr	flags, (1<<STARTUP)
-
-		;delay_wdr	30*TICKS_PER_MS
-		;rcall	beep_1
-
 		lds	XL, startup_attempts
 		cpi	XL, 2
 		brsh	su_com				; if it's the first startup
@@ -1137,7 +1178,8 @@ su_com:		rcall	commutate
 		clr	BL
 		clr	BH
 		clr	CL
-		delay	20*TICKS_PER_MS
+		;delay_wdr	20*TICKS_PER_MS
+
 start_loop:	sbrc	flags2, SIGNAL_ERROR		; signal error?
 		rcall	handle_signal_error		; yes, handle it
 		rcall	update_power			; read power
@@ -1184,7 +1226,7 @@ su_pow_ok:
 		add	XL, BL
 		adc	XH, BH
 		adc	YL, CL
-		rcall	timer_set
+		rcall	timer_set ; ------------------------------------------------------------------------------------------------------------------- rel
 
 		lds	AL, startup_counter
 		dec	AL
@@ -1237,9 +1279,7 @@ running_mode_switch:
 		sts	com_length_l, XL
 		sts	com_length_h, XH
 		sts	com_length_e, YL
-		.if	LED_DBG
-		  cbi	LED1_PORT, LED1_PIN
-		.endif
+		led_dbg	1, 0
 		clr	XL
 		sts	timing_angle, XL
 		sts	gov_error, XL
@@ -1252,9 +1292,7 @@ running_mode_switch:
 		sts	zc_scan_time_l, XL
 		sts	zc_scan_time_h, XH
 		sts	zc_scan_time_e, YL
-		.if	LED_DBG
-		  sbi	LED7_PORT, LED7_PIN
-		.endif
+		led_dbg	7, 1
 		rcall	update_power
 		sts	gov_throttle_l, XL
 		sts	gov_throttle_h, XH
@@ -1272,10 +1310,6 @@ running_loop:
 		lsl	XL				; multiply by 2
 		rol	XH
 		rol	YL
-		.if	LED_DBG
-		sbi	LED3_PORT, LED3_PIN
-		cbi	LED3_PORT, LED3_PIN
-		.endif
 		add	XL, YH				; add two commutation lengths to the current time
 		adc	XH, DL
 		adc	YL, DH
@@ -1303,10 +1337,7 @@ running_loop:
 rl_zcd:		sbrc	flags, TIMER_READY		; Ok, ZC or timout occured
 		rjmp	start_up			; timeout, go to start procedure
 							; ZC otherwise
-		.if	LED_DBG
-		sbi	LED1_PORT, LED1_PIN
-		cbi	LED3_PORT, LED3_PIN
-		.endif
+		led_dbg	1, 1
 		
 		; --- ZC FILTERING ---
 		; ZC detection times are not even, it's beneficial to filter them and reduce the error.
@@ -1322,9 +1353,11 @@ rl_zcd:		sbrc	flags, TIMER_READY		; Ok, ZC or timout occured
 		ror	YL				; with carry, it can still be there from addition
 		ror	XH
 		ror	XL				; got it
+/*	.if GOVERNOR_MODE
 		push	YL
 		push	XH
 		push	XL
+	.endif*/
 		sts	com_length_l, XL		; store it as commutation length
 		sts	com_length_h, XH
 		sts	com_length_e, YL
@@ -1336,7 +1369,7 @@ rl_zcd:		sbrc	flags, TIMER_READY		; Ok, ZC or timout occured
 		sts	previous_zc_time_l, XL		; store it for the next time
 		sts	previous_zc_time_h, XH
 		sts	previous_zc_time_e, YL
-	.else					; if ZC filtering disabled
+	.else						; if ZC filtering disabled
 		lti	AL, AH, BL, BH, 1		; get time of detected ZC
 		movw	XL, AL				; copy
 		mov	YL, BL
@@ -1406,7 +1439,8 @@ ct_skt:	;sei
 		rcall	handle_signal_error		; yes, handle it
 		rcall	update_power			; read power
 		
-	.if	GOVERNOR_MODE == 1					
+/*	.if	GOVERNOR_MODE == 1	
+WIP				
 
 		; Automatic throttle control in order to achieve specified RPM
 		; ClockTicks - number of clock ticks per second
@@ -1419,9 +1453,9 @@ ct_skt:	;sei
 		; The controller will be trying to achieve equality of this equation by modifying T on the left side
 		; (commutation time) by adjustment of throttle and thus motor speed. The control method is somewhat
 		; similar to PID regulation.
-		lds	DL, com_length_l		; load commutation length
-		lds	DH, com_length_h
-		lds	YL, com_length_e			
+		lds	DL, avg_com_length_l		; load commutation length
+		lds	DH, avg_com_length_h
+		lds	YL, avg_com_length_e			
 		pop	AL
 		pop	AH
 		pop	BL
@@ -1474,13 +1508,19 @@ ct_skt:	;sei
 		lds	XH, gov_throttle_h
 		brcc	rl_gov_throt_inc		; carry clear? yes: left side greater, jump
 rl_gov_throt_dec:					; left side lower => T must increase => throttle must drop
-		sub	YH, AL
-		sbc	CL, AH
-		sbc	CH, BL
-		
+		;sub	YH, AL
+		;sbc	CL, AH
+		;sbc	CH, BL
+
 		com	YH
 		com	CL
 		com	CH
+		lsr	YH
+		ror	CH
+		ror	CL
+		lsr	YH
+		ror	CH
+		ror	CL
 
 		mul	YH, DL				; --- 8 x 24 bit multiplication ---
 		clr	BH
@@ -1498,10 +1538,15 @@ rl_gov_throt_dec:					; left side lower => T must increase => throttle must drop
 		clr	XH
 		rjmp	rl_gov_ti_01
 rl_gov_throt_inc:					; left side higher => T must drop => throttle must increase
-		sub	YH, AL
-		sbc	CL, AH
-		sbc	CH, BL
-
+		;sub	YH, AL
+		;sbc	CL, AH
+		;sbc	CH, BL
+		lsr	YH
+		ror	CH
+		ror	CL
+		lsr	YH
+		ror	CH
+		ror	CL
 		mul	YH, DL				; --- 8 x 24 bit multiplication ---
 		clr	BH
 		mov	BL, AH				; we only use the high byte of multiplication result
@@ -1520,8 +1565,8 @@ rl_gov_throt_inc:					; left side higher => T must drop => throttle must increas
 		ldi	XL, POWER_RANGE_L
 		ldi	XH, POWER_RANGE_H
 rl_gov_ti_01:	sts	gov_throttle_l, XL
-		sts	gov_throttle_h, XH
-	.else
+		sts	gov_throttle_h, XH*/
+	;.else
 
 		; Normal mode
 		lds	DL, com_length_l		;  yes, load commutation length
@@ -1533,7 +1578,7 @@ rl_gov_ti_01:	sts	gov_throttle_l, XL
 		brcc	rl_p_ok				; no carry? rpm not too fast, just jump and set sdm factor
 		lsr	XH				; too fast? divide power by 2
 		ror	XL
-	.endif
+	;.endif
 
 rl_p_ok:	movw	sdm_factor_l, XL
 
@@ -1545,43 +1590,118 @@ rl_p_ok:	movw	sdm_factor_l, XL
 ; *------------------*
 ; |      Reset       |
 ; *------------------*
-reset:		sbi	RL_DDR, RL_PIN			; set fet controlling pins as out
+reset:		in	XL, MCUCSR			; read reset reason
+		push	XL
+		clr	XL
+		out	MCUCSR, XL
+		sbi	RL_DDR, RL_PIN			; set fet controlling pins as out
 		sbi	RH_DDR, RH_PIN
 		sbi	SL_DDR, SL_PIN
 		sbi	SH_DDR, SH_PIN
 		sbi	TL_DDR, TL_PIN
 		sbi	TH_DDR, TH_PIN
-	.if	LED_DBG
-		sbi	LED0_DDR, LED0_PIN
-		sbi	LED1_DDR, LED1_PIN
-		sbi	LED2_DDR, LED2_PIN
-		sbi	LED3_DDR, LED3_PIN
-		sbi	LED4_DDR, LED4_PIN
-		sbi	LED5_DDR, LED5_PIN
-		sbi	LED6_DDR, LED6_PIN
-		sbi	LED7_DDR, LED7_PIN
-	.endif
-
 		rcall	motor_free_run			; close all fets , just in case
+
+		.if	LED_DEBUG				; and LEDs...
+		 .ifdef LED0_PORT
+		  sbi	LED0_DDR, LED0_PIN
+		  cbi	LED0_PORT, LED0_PIN
+		 .endif
+		 .ifdef LED1_PORT
+		  sbi	LED1_DDR, LED1_PIN
+		  cbi	LED1_PORT, LED1_PIN
+		 .endif
+		 .ifdef LED2_PORT
+		  sbi	LED2_DDR, LED2_PIN
+		  cbi	LED2_PORT, LED2_PIN
+		 .endif
+		 .ifdef LED3_PORT
+		  sbi	LED3_DDR, LED3_PIN
+		  cbi	LED3_PORT, LED3_PIN
+		 .endif
+		 .ifdef LED4_PORT
+		  sbi	LED4_DDR, LED4_PIN
+		  cbi	LED4_PORT, LED4_PIN
+		 .endif
+		 .ifdef LED5_PORT
+		  sbi	LED5_DDR, LED5_PIN		; my test board actually has so many leds.
+		  cbi	LED5_PORT, LED5_PIN
+		 .endif
+		 .ifdef LED6_PORT
+		  sbi	LED6_DDR, LED6_PIN
+		  cbi	LED6_PORT, LED6_PIN
+		 .endif
+		 .ifdef LED7_PORT
+		  sbi	LED7_DDR, LED7_PIN
+		  cbi	LED7_PORT, LED7_PIN
+		 .endif
+		.endif
+
+		; init stuff
 		rcall	reset_vars
+
+		; enable timer interrupts of timers
 		ldi	XL, (1<<TOIE1) | (1<<OCIE1A) | (1<<TOIE2)
 		out	TIMSK, XL
-		ldi	XL, (1<<CS20) | (1<<CS21) |(1<<CS22); timer2 prescaler 1024
+		
+		; timer2 prescaler 1024
+		ldi	XL, (1<<CS20) | (1<<CS21) |(1<<CS22)
 		out	TCCR2, XL
-		ldi	XL, 1<<CS10			; timer1, main timer, no prescaler
+		
+		; timer1, main timer, no prescaler
+		ldi	XL, 1<<CS10
 		out	TCCR1B, XL
-		ldi	XL, 1<<CS00			; timer0, sigma-delta madulator, no prescaler
+		
+		; timer0, sigma-delta madulator, no prescaler
+		ldi	XL, 1<<CS00			
 		out	TCCR0, XL
-		cbi	RCP_DIR_REG, RCP_PIN		; rc pulse pin as input
+
+		; RC pulse input
+		cbi	RCP_DIR_REG, RCP_PIN		; set rc pulse pin as input
 		ldi	XL, MCUCR_VAL			; set external int to trigger on any logic change
 		out	MCUCR, XL
 		ldi	XL, GICR_VAL			; enable external interrupt
 		out	GICR, XL
+
+		; comparator
 		ldi	XL, 1<<ACME			; analog comparator multiplexer enable
 		out	SFIOR, XL
+
+		sei					; enable interrupts
+	;	delay	50*TICKS_PER_MS
+		
+		; watchdog
 		ldi	XL, 1<<WDE			; enable watchdog, with no proescaler, ~16ms
 		out	WDTCR, XL
-		sei					; enable interrupts
+		wdr					; reset just in case
+	
+		;rjmp	test
 
 		rjmp	start_up
-.exit
+
+test:		pop	XL
+reset_chk_wdr:	sbrs	XL, WDRF
+		rjmp	reset_chk_bo
+		rcall	beep_wdr			; watchdog reset occured
+		rjmp	reset_chk_done
+
+reset_chk_bo:	sbrs	XL, BORF		
+		rjmp	reset_chk_ext
+		rcall	beep_bo				; brown-out occured
+		rjmp	reset_chk_done		
+		
+reset_chk_ext:	sbrs	XL, EXTRF
+		rjmp	reset_chk_po
+		rcall	beep_extr
+		rjmp	reset_chk_done
+
+reset_chk_po:	sbrc	XL, PORF
+		rjmp	reset_ok
+		rcall	beep_single			; uncrecognized reset reason, no flag set. wtf?
+		rjmp	reset_chk_done
+
+reset_ok:	rcall	beep_po				; normal power on start occured
+
+reset_chk_done:	rcall	motor_free_run
+
+		rjmp	start_up
