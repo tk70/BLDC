@@ -5,24 +5,26 @@
 ; clock frequency [MHz]
 .equ CLOCK_MHZ = 16
 
-.equ CONTROL_METHOD = 1								; 1 - RC pulse, 2 - I2C (coming soon)
+.equ CONTROL_METHOD = 2					; 1 - RC pulse, 2 - I2C (coming soon)
+
+.equ I2C_SLAVE_ADDRESS = 4
 
 ; if rc pulse used
 .equ RCP_CHANNEL = 0
 
-.equ PWM_SIDE = 1									; which FET side does the PWM; 1 - low, 2 - high
+.equ PWM_SIDE = 1					; which FET side does the PWM; 1 - low, 2 - high
 
 ; pins
 ; phase R
-.equ RL_PIN	=	PB5									; low gate mosfet
+.equ RL_PIN	=	PB5				; low gate mosfet
 .equ RL_PORT =		PORTB
 .equ RL_DDR =		DDRB
 
-.equ RH_PIN	=	PD0									; high gate mosfet
+.equ RH_PIN	=	PD0				; high gate mosfet
 .equ RH_PORT =		PORTD
 .equ RH_DDR =		DDRD
 
-.equ R_COMP_CHANNEL	= 0								; phase comparator channel (port C)
+.equ R_COMP_CHANNEL	= 0				; phase comparator channel (port C)
 
 
 ; phase S

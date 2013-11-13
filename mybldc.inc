@@ -5,7 +5,9 @@
 ; clock frequency [MHz]
 .equ CLOCK_MHZ = 16
 
-.equ CONTROL_METHOD = 1								; 1 - RC pulse, 2 - I2C (coming soon)
+.equ CONTROL_METHOD = 2								; 1 - RC pulse, 2 - I2C (coming soon)
+
+.equ I2C_SLAVE_ADDRESS = 4
 
 ; if rc pulse used
 .equ RCP_CHANNEL = 0

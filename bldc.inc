@@ -27,9 +27,8 @@
 
 .equ START_UP_COUNTER = 254				; how many full commutations the motor must do before the switch to the running mode, 254 max
 
-;.equ STARTUP_PULL_POWER = RCP_RANGE / 6		; pull power, first startup step
-.equ STARTUP_MAX_POWER = RCP_RANGE / 6			; max power used during startup
-.equ STARTUP_MIN_POWER = RCP_RANGE / 10			; min
+.equ STARTUP_MAX_POWER = 16				; % max power used during startup
+.equ STARTUP_MIN_POWER = 10				; % min
 .equ STARTUP_MIN_RPM = 150
 .equ STARTUP_FORCED_COM_NUMBER = 2
 
