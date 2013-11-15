@@ -8,7 +8,7 @@
 .equ RCP_MAX = 2200					; maximal accepted pulse length
 
 
-.equ TIMING_ADVANCE = 0				; [0-128] -> [0°-30°]. motor timing advance
+.equ TIMING_ADVANCE = 80				; [0-128] -> [0°-30°]. motor timing advance
 							; 0->no advance, ..., 64->15°, ..., 128->30° advance etc
 .equ ACTIVE_FREEWHEELING = 0				; aka complementary PWM
 
@@ -25,7 +25,7 @@
 .equ RPM_THR_1 = 8000
 .equ PWR_THR_1 = RCP_RANGE / 2
 
-.equ START_UP_COUNTER = 254				; how many full commutations the motor must do before the switch to the running mode, 254 max
+.equ START_UP_COUNTER = 48				; how many full commutations the motor must do before the switch to the running mode, 254 max
 
 .equ STARTUP_MAX_POWER = 16				; % max power used during startup
 .equ STARTUP_MIN_POWER = 10				; % min
