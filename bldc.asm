@@ -1,4 +1,4 @@
-;
+d;
 ;	Electronic Speed Controller for a BLDC motor.
 ;	
 ;	Software written for ATMega8 microcontroller
@@ -440,52 +440,28 @@ timer_ocr1a_int:
 
 		; The timer may have been set to switch to the next commutation
 		sbrs	flags, TIMER_COMMUTATE		; the timer has to call the commutation?
-		rjmp	timer_zc_chk			; no, it doesn't
+		rjmp	reti_sreg_restore		; no, it doesn't
 
 timer_switch_commutation:		
 		lds	ZL, next_comm_call_addr_l	; load the function pointer to be called
 		lds	ZH, next_comm_call_addr_h
-		icall					; call the function
+		icall					; call the commutation function
 		wdr
-		in	JL, TCNT1L
-		in	JH, TCNT1H
-		ldi	JE, 16				; ---------------------opt
-		add	JL, JE
-		ldi	JE, 0
-		adc	JH, JE
-		out	OCR1AH, JH
-		out	OCR1AL, JL
-		ldi	JE, 1<<OCF1A
-		out	TIFR, JE
 		cbr	flags, (1<<TIMER_READY) | (1<<TIMER_COMMUTATE)
-		ldi	JE, 0
-		sts	ocr1ae, JE
-		sbr	flags, 1<<TIMER_START_ZC_SCAN
-		out	SREG, IL
-		reti
 
-timer_zc_chk:	sbrs	flags, TIMER_START_ZC_SCAN	; the timer has to start ZC scan?
-		rjmp	reti_sreg_restore		; no
-
-timer_set_zc_scan:
-		; Activate the zero crossing scan.
-		; First, set the timeout for the operation.
-		in	JL, TCNT1L
-		in	JH, TCNT1H
-		lds	JE, zc_timeout_l		; load calculated timeout for ZC
-		add	JL, JE
-		lds	JE, zc_timeout_h
-		adc	JH, JE
-		out	OCR1AH, JH
-		out	OCR1AL, JL
-		ldi	JE, 1<<OCF1A
+		; The commutation has been switched. It's time to await the next ZC.
+		; But before we do that, we must confirm that correct pre-ZC state occured.
+		; Otherwise the comparator will trigger the interrupts too early because of some noises and the motor
+		; will lose sync.
+		; Timer2 will keep scanning the comparator until the pre-ZC state occurs.
+		ldi	JE, 190				; set the timer to trigger interrupt in 65 cycles
+		out	TCNT2, JE
+		ldi	JE, 1<<TOV2			; clear pending interrupt
 		out	TIFR, JE
-		cbr	flags, (1<<TIMER_READY) | (1<<TIMER_START_ZC_SCAN)
-		lds	JE, zc_timeout_e
-		sts	ocr1ae, JE
-
-		; Activate comparator interrupts
-		sbi	ACSR, ACIE
+		in	JE, TIMSK
+		sbr	JE, 1<<TOIE2			; enable ovf interrupt
+		out	TIMSK, JE
+		led	0, 1
 
 		; Return
 reti_sreg_restore:
@@ -508,10 +484,55 @@ t_sig_fail:	rjmp	signal_err
 
 
 ; Timer2 overflow interrupt
-t2_ovf_int:		in	IL, SREG
-		;led_dbg	2, 0
+; This timer activates the comparator scan (comparator edge interrupt) after commutation routine.
+; The timer is called with short delays until it detects the proper pre-ZC state on the comparator.
+; This code is a temporary fix for motor sync losses on low RPMs which happened due to errorneous,
+; too early detections. I plan to make it also comparator interrupt driven, instead of timer-sampled.
+t2_ovf_int:	in	IL, SREG
+		
+		sbic	ACSR, ACIS0
+		rjmp	t2_scan_for_low_state
+t2_scan_for_high_state:
+		sbis	ACSR, ACO
+		rjmp	t2_set_again
+		rjmp	t2_set_aco
+t2_scan_for_low_state:
+		sbic	ACSR, ACO
+		rjmp	t2_set_again
+		
+		; Pre ZC state detected.
+		; Activate the zero crossing scan.
+		; First, set the timeout for the operation.
+t2_set_aco:	in	JL, TCNT1L
+		in	JH, TCNT1H
+		lds	JE, zc_timeout_l		; load calculated timeout for ZC
+		add	JL, JE
+		lds	JE, zc_timeout_h
+		adc	JH, JE
+		out	OCR1AH, JH
+		out	OCR1AL, JL
+		ldi	JE, 1<<OCF1A
+		out	TIFR, JE
+		cbr	flags, (1<<TIMER_READY) | (1<<TIMER_START_ZC_SCAN)
+		lds	JE, zc_timeout_e
+		sts	ocr1ae, JE
+
+		; Disable timer2 interrupts
+		in	JE, TIMSK
+		cbr	JE, 1<<TOIE2
+		out	TIMSK, JE
+
+		; Activate comparator interrupts. The comparator will trigger an interrupt when the ZC occurs.
+		sbi	ACSR, ACIE
 		out	SREG, IL
+		led	0, 0
 		reti
+
+		; Set this intrrupt to trigger again in 65 cycles
+t2_set_again:	ldi	JE, 190
+		out	TCNT2, JE
+		out	SREG, IL
+		reti	
 
 
 ; wait X * 8 cycles, args: XH:XL
@@ -1377,9 +1398,12 @@ shs_ret:	ret
 start_up_again:	lds	XL, startup_attempts
 		inc	XL
 		sts	startup_attempts, XL
-start_up:	clr	XL
+start_up:	clr	XL				; reset some vars in case we just quit running mode
 		sts	rpm_l, XL
 		sts	rpm_h, XL
+		in	XL, TIMSK			; disable timer2 interrupt
+		cbr	XL, 1<<TOIE2
+		out	TIMSK, XL
 		rcall	start_handle_signal
 		sbr	flags, (1<<STARTUP)
 		cbr	flags, (1<<RUN)
@@ -1492,14 +1516,13 @@ running_mode_switch:
 ; The single motor cycle begins in this place. The analog comparator which we have set after some commutation routine,
 ; is telling us that a Zero Crossing occured, by calling an interrupt here.
 run_acomp_int:	in	JE, SREG
-		lti	IL, IH, JL, JH, 0		; Read the time of the ZC
-		sbis	ACSR, ACIS0			; Check what kind of edge we were waiting for
+		clt					; Clear the T flag, we will use it below
+run_aco_check:	sbis	ACSR, ACIS0			; Check what kind of edge we were waiting for
 		rjmp	run_aco_1_0
 
-		; We have spent a few cycles reading the timer.
 		; Check the ACO state if it's correct, it may have been some spike.
 run_aco_0_1:	sbis	ACSR, ACO
-		rjmp	run_aco_reti			; --------------- optimize
+		rjmp	run_aco_reti
 		rjmp	run_aco_zc
 
 run_aco_1_0:	sbis	ACSR, ACO
@@ -1507,13 +1530,21 @@ run_aco_1_0:	sbis	ACSR, ACO
 run_aco_reti:	out	SREG, JE
 		reti
 
+		; Seems there is a proper state on the comparator.
+		; But experiments show that on low RPM it still can be an erroneous detection.
+		; We will wait some time reading the timer, and do one more check
+run_aco_zc:	brts	run_aco_zc2			; T flag set means that it was the second check, move on.
+		set
+		lti	IL, IH, JL, JH, 0		; Read the time of the ZC
+		rjmp	run_aco_check			; Do one more check
+
 		; We've decided that proper ZC occured.
 		; However, it may have interrupted some calculations, like speed, governor, power control on so on.
 		; In that case we will have to save the context, to restore it later. Somewhat like in multithreading.
-run_aco_zc:	bst	flags2, CALC_IN_PROGRESS	; Interrupted some calculations?
+run_aco_zc2:	bst	flags2, CALC_IN_PROGRESS	; Interrupted some calculations?
 		brts	run_save_context		; It did
-		pop	JE				; Nah, it didn't
-		pop	JE				; Just get rid of the PC that the interrupt threw onto stack
+		pop	JH				; Nah, it didn't
+		pop	JH				; Just get rid of the PC that the interrupt threw onto stack
 		rjmp	run_process_zc
 
 run_save_context:					; Save all registers used in these calculations
@@ -1533,7 +1564,8 @@ run_save_context:					; Save all registers used in these calculations
 		; But we won't remove them on purpose, so later we can dig it out of the stack, when it's time
 		; to restore the context.
 		
-run_process_zc:	cbi	ACSR, ACIE			; Disable comparator interrupts
+
+run_process_zc: cbi	ACSR, ACIE			; Disable comparator interrupts
 		sbi	ACSR, ACI
 		movw	BL, IL				; Move the ZC time
 		mov	CL, JL
@@ -1554,12 +1586,6 @@ run_process_zc:	cbi	ACSR, ACIE			; Disable comparator interrupts
 		sub	BL, CH				; get time delta between current and previous ZC (CL:BH:BL)
 		sbc	BH, DL
 		sbc	CL, DH
-	lsl	BL
-	rol	BH
-	rol	CL
-	lsl	XL
-	rol	XH
-	rol	YL
 		add	XL, BL				; so we've got previously saved commutation length, and time delta
 		adc	XH, BH				;  between this and previous ZC. make arithmetic mean of it
 		adc	YL, CL				;  (YL:XH:XL)
@@ -1570,9 +1596,6 @@ run_process_zc:	cbi	ACSR, ACIE			; Disable comparator interrupts
 		ror	YL				; with carry, it can still be there from addition
 		ror	XH
 		ror	XL				; got it
-	ror	YL				; with carry, it can still be there from addition
-	ror	XH
-	ror	XL	
 		sts	com_length_l, XL		; store it as commutation length
 		sts	com_length_h, XH
 		sts	com_length_e, YL
@@ -1890,8 +1913,8 @@ reset_clr_lp:	st	X+, YL				; clear ram variables
 		ldi	XL, (1<<TOIE1) | (1<<OCIE1A) | (1<<TOIE2)
 		out	TIMSK, XL
 
-		; timer2 prescaler 1024
-		ldi	XL, (1<<CS20) | (1<<CS21) |(1<<CS22)
+		; timer2 prescaler 0
+		ldi	XL, 1<<CS20
 		out	TCCR2, XL
 		
 		; timer1, main timer, no prescaler
