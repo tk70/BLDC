@@ -1,17 +1,16 @@
-d;
+;
 ;	Electronic Speed Controller for a BLDC motor.
 ;	
 ;	Software written for ATMega8 microcontroller
 ;	
 ;	by tk
-;	v 0.22
-;	3.09.2013
+;	v 0.23
+;	27.11.2013
 
 
 ; This software is still in Alpha version
 ; 
 ; The todo list:
-; - I2C protocols
 ; - proper active rectification (unfinished yet)
 ; - governor mode (unfinished yet)
 ; - reverse
@@ -33,12 +32,33 @@ d;
 .equ MIN_RPS = MIN_RPM / 60
 .equ MAX_RPS = MAX_RPM / 60
 .equ GOV_MAX_RPS = GOVERNOR_MAX_RPM / 60
-.equ SPEED_THR_1 = 1000000*10*TICKS_PER_US/RPM_THR_1
 
 .if CONTROL_METHOD == 1
- .equ POWER_RANGE = (RCP_MAX_THR - RCP_MIN_THR)*TICKS_PER_US
+	; If we chose RC pulse as control method
+	.if RCP_CHANNEL == 0
+		.equ MCUCR_VAL = 1<<ISC00
+		.equ GICR_VAL = 1<<INT0
+		.equ RCP_DIR_REG = DDRD
+		.equ RCP_PIN_REG = PIND
+		.equ RCP_PIN = PD2
+	.elif RCP_CHANNEL == 1
+		.equ MCUCR_VAL = 1<<ISC10
+		.equ GICR_VAL = 1<<INT1
+		.equ RCP_DIR_REG = DDRD
+		.equ RCP_PIN_REG = PIND
+		.equ RCP_PIN = PD3
+	.else
+		.error	"Invalid constant: RCP_CHANNEL. Please select 0 (external interrupt 0) or 1 (external interrupt 1)"
+	.endif
+	.equ POWER_RANGE = (RCP_MAX_THR - RCP_MIN_THR)*TICKS_PER_US
+
 .elif CONTROL_METHOD == 2
- .equ POWER_RANGE = 255
+	; If we	chose I2C pulse as control method
+	 .if I2C_PROTOCOL == 1
+		.equ POWER_RANGE = 255			; 8 bit power resolution
+	.else
+		.equ POWER_RANGE = 2047			; 11 bit power resolution
+	.endif
 .endif
 
 .equ POWER_RANGE_L = low(POWER_RANGE)
@@ -56,24 +76,6 @@ d;
 .equ STARTUP_COM_TIMEOUT = 1000000*10*TICKS_PER_US/STARTUP_MIN_RPM
 
 .equ COM_DELAY = 128 - TIMING_ADVANCE
-
-.if RCP_CHANNEL == 0
-	.equ MCUCR_VAL = 1<<ISC00
-	.equ GICR_VAL = 1<<INT0
-	.equ RCP_DIR_REG = DDRD
-	.equ RCP_PIN_REG = PIND
-	.equ RCP_PIN = PD2
-.else
-.if RCP_CHANNEL == 1
-	.equ MCUCR_VAL = 1<<ISC10
-	.equ GICR_VAL = 1<<INT1
-	.equ RCP_DIR_REG = DDRD
-	.equ RCP_PIN_REG = PIND
-	.equ RCP_PIN = PD3
-.else
-	.error	"Invalid constant: RCP_CHANNEL. Please select 0 (external interrupt 0) or 1 (external interrupt 1)"
-.endif
-.endif
 
 ; Beeper on state in one cycle time [us]
 .equ BEEP_ON_TIME = 20
@@ -98,7 +100,7 @@ d;
 ; *------------------*
 
 ; RC pulse registers
-.def rcp_timeout = r6
+.def sig_timeout = r6
 .def rcp_fail_count = r7
 .def rcp_time_l = r8			
 .def rcp_time_h = r9
@@ -127,28 +129,32 @@ d;
 .def JE = r22
 
 ; General flag registers
-.def flags = r23					; pwm generator state flag
-	.equ SDM_ACTIVE = 0				; is pwm wave being generated? no (0), yes (1)
-	.equ SDM_STATE = 1				; set once 16bit timer1 overflows	
-	.equ TIMER_READY = 2				; ready flag A
-	.equ BRAKED = 3					; set if motor is braked
-	.equ STARTUP = 4				; set if motor is in the starting mode
-	.equ RUN = 5					; set if motor is in the running mode
-	.equ TIMER_COMMUTATE = 6			; should timer call the next commutation?
-	.equ TIMER_START_ZC_SCAN = 7
+.def flags = r23					; PWM generator state flag
+	.equ SDM_ACTIVE = 0				; Is pwm wave being generated? no (0), yes (1)
+	.equ SDM_STATE = 1				; Set once 16bit timer1 overflows	
+	.equ READY = 2
+	.equ BRAKED = 3					; Set if motor is braked
+	.equ STARTUP = 4				; Set if motor is in the starting mode
+	.equ RUN = 5					; Set if motor is in the running mode
+
 
 .def flags2 = r24
-	.equ CALC_IN_PROGRESS = 0			; 1 if calcuations are in progress
+	.equ CALC_IN_PROGRESS = 0			; Calcuations are in progress?
 	.equ BEEPER = 2
 	.equ BEEP_CYCLE = 3
-	.equ RCP_AWAITING_L = 4				; set if waiting for falling RC signal edge
-	.equ RCP_CHECK_TIMEOUT = 5
+	.equ SIGNAL_AWAITING = 4			; Waiting for falling RC signal edge?
+
 	.equ SIGNAL_READY = 6
 	.equ SIGNAL_ERROR = 7
 
 .def flags3 = r25
 	.equ UPDATE_RPM = 0
 	.equ CYCLE_DONE = 1
+	.equ TIMER_READY = 2
+	.equ TIMER_COMMUTATE = 3			; Should timer call the next commutation?
+	.equ TIMER_START_ZC_SCAN = 4
+	.equ I2C_RESPOND_STATUS = 6
+	.equ I2C_RESPOND_SPEED = 7			; Respond with speed when entring Slave Transmitter mode?
 	
 
 ; *------------------*
@@ -166,12 +172,12 @@ d;
 	previous_zc_time_l:	.byte	1		; time of the previous zero cross detection
 	previous_zc_time_h:	.byte	1
 	previous_zc_time_e:	.byte	1
-	cycle_length_l:		.byte	1		; averaged commutation length
-	cycle_length_h:		.byte	1
-	cycle_length_e:		.byte	1
+	avg_com_len_l:		.byte	1		; averaged commutation length
+	avg_com_len_h:		.byte	1
+	avg_com_len_e:		.byte	1
 	rpm_l:			.byte	1
 	rpm_h:			.byte	1
-	i2c_rpm_h:		.byte	1		
+	i2c_tmp1:		.byte	1	
 	zc_timeout_l:		.byte	1		; time of comparator scan activation
 	zc_timeout_h:		.byte	1
 	zc_timeout_e:		.byte	1
@@ -252,11 +258,11 @@ stloop:		nop
 ; *------------------*
 
 .macro flash_led
-		push	XL
+/*		push	XL
 		ldi	XL, 0
 		out	TCNT2, XL
 		;led_dbg	2, 1
-		pop	XL
+		pop	XL*/
 .endmacro
 
 .macro set_pin	.if @2					; if high state
@@ -348,14 +354,14 @@ stloop:		nop
 
 ; Wait until the timer reaches set value
 .macro	wait
-wait_loop:	sbrs	flags, TIMER_READY
+wait_loop:	sbrs	flags3, TIMER_READY
 		rjmp	wait_loop
 .endmacro
 
 ; the same but with watchdog reset
 .macro	wait_wdr
 wait_loop_wdr:	wdr
-		sbrs	flags, TIMER_READY
+		sbrs	flags3, TIMER_READY
 		rjmp	wait_loop_wdr
 .endmacro
 
@@ -394,15 +400,15 @@ timer_set:	ldi	DL, 1<<OCF1A
 		out	OCR1AL, XL
 		out	TIFR, DL			; clear interrupt flag if pending
 		lti	YH, DL, DH, IL, 0		; read timer value. with 0 in the last arg, it won't reenable interrupts with "sei"
-		cbr	flags, 1<<TIMER_READY
+		cbr	flags3, 1<<TIMER_READY
 		sub	XL, YH				; calculate time delta between set ocr1a time and timer value
 		sbc	XH, DL
 		sbc	YL, DH
 		sts	ocr1ae, YL			; set ocr1a value	
 		sbrs	YL, 7				; is the most significant bit of time delta set?
 		rjmp	ts_ret				; nah. the time hasn't come yet
-		sbr	flags, 1<<TIMER_READY		; yes. time delta is above mid timer value, meaning time of compare match has passed already. set ready flag
-		sbrc	flags, TIMER_COMMUTATE		; the timer has to call the commutation?
+		sbr	flags3, 1<<TIMER_READY		; yes. time delta is above mid timer value, meaning time of compare match has passed already. set ready flag
+		sbrc	flags3, TIMER_COMMUTATE		; the timer has to call the commutation?
 		rjmp	timer_switch_commutation	; yes
 ts_ret:		reti					; no, enable interrupts and return (reti = sei + ret)
 
@@ -421,7 +427,7 @@ timer_set_relative:
 		out	OCR1AH, DH			; out it
 		out	OCR1AL, DL
 		out	TIFR, YH			; clear interrupt flag just in case interrupt is waiting
-		cbr	flags, 1<<TIMER_READY
+		cbr	flags3, 1<<TIMER_READY
 		sts	ocr1ae, YL			; store the extended byte
 		reti					; reti = sei + ret
 
@@ -435,11 +441,11 @@ timer_ocr1a_int:
 		dec	IH
 		sts	ocr1ae, IH
 		brpl	reti_sreg_restore
-		sbr	flags, 1<<TIMER_READY		; --------------------opt
+		sbr	flags3, 1<<TIMER_READY		; --------------------opt
 
 
 		; The timer may have been set to switch to the next commutation
-		sbrs	flags, TIMER_COMMUTATE		; the timer has to call the commutation?
+		sbrs	flags3, TIMER_COMMUTATE		; the timer has to call the commutation?
 		rjmp	reti_sreg_restore		; no, it doesn't
 
 timer_switch_commutation:		
@@ -447,7 +453,7 @@ timer_switch_commutation:
 		lds	ZH, next_comm_call_addr_h
 		icall					; call the commutation function
 		wdr
-		cbr	flags, (1<<TIMER_READY) | (1<<TIMER_COMMUTATE)
+		cbr	flags3, (1<<TIMER_READY) | (1<<TIMER_COMMUTATE)
 
 		; The commutation has been switched. It's time to await the next ZC.
 		; But before we do that, we must confirm that correct pre-ZC state occured.
@@ -470,13 +476,13 @@ reti_sreg_restore:
 
 
 ; Timer1 overflow interrupt
-timer_t1ovf_int:
+timer_t1ovf_int:led 1, 0
 		in	IL, SREG
 		lds	JL, tcnt1e
 		inc	JL
 		sts	tcnt1e, JL
 		sbr	flags3, 1<<UPDATE_RPM
-		dec	rcp_timeout
+		dec	sig_timeout
 		breq	t_sig_fail
 		out	SREG, IL
 		reti
@@ -489,7 +495,6 @@ t_sig_fail:	rjmp	signal_err
 ; This code is a temporary fix for motor sync losses on low RPMs which happened due to errorneous,
 ; too early detections. I plan to make it also comparator interrupt driven, instead of timer-sampled.
 t2_ovf_int:	in	IL, SREG
-		
 		sbic	ACSR, ACIS0
 		rjmp	t2_scan_for_low_state
 t2_scan_for_high_state:
@@ -513,7 +518,7 @@ t2_set_aco:	in	JL, TCNT1L
 		out	OCR1AL, JL
 		ldi	JE, 1<<OCF1A
 		out	TIFR, JE
-		cbr	flags, (1<<TIMER_READY) | (1<<TIMER_START_ZC_SCAN)
+		cbr	flags3, (1<<TIMER_READY) | (1<<TIMER_START_ZC_SCAN)
 		lds	JE, zc_timeout_e
 		sts	ocr1ae, JE
 
@@ -574,7 +579,7 @@ rcp_int:	in	IL, SREG
 		sbic	RCP_PIN_REG, RCP_PIN		; is it low or high state?
 		rjmp	rcp_rcp_high_state
 		led_dbg	4, 0
-		sbrs	flags2, RCP_AWAITING_L		; check if we are waiting for a falling edge
+		sbrs	flags2, SIGNAL_AWAITING		; check if we are waiting for a falling edge
 		rjmp	reti_sreg_restore				; no, return
 		in	JL, TCNT1L			; yes, calculate length of the impulse
 		in	JH, TCNT1H
@@ -599,7 +604,7 @@ rcp_int:	in	IL, SREG
 rcp_cl:		cbr	flags2, 1<<SIGNAL_ERROR		; no
 rcp_ok:		clr	rcp_fail_count			; no, been ok before
 		ldi	JE, 25				; ~ 100 ms timeout
-		mov	rcp_timeout, JE
+		mov	sig_timeout, JE
 		sts	power_signal_l, JL
 		sts	power_signal_h, JH
 		out	SREG, IL
@@ -612,13 +617,12 @@ rcp_rcp_fail2:	ldi	JL, 3
 		reti
 
 rcp_rcp_high_state:					; rising edge detected. start measuring how long it is
-		sbr	flags2, 1<<RCP_CHECK_TIMEOUT
 		led_dbg	4, 1
-		sbr	flags2, 1<<RCP_AWAITING_L	; mark that we are waiting for low state now
+		sbr	flags2, 1<<SIGNAL_AWAITING	; mark that we are waiting for low state now
 		in	rcp_time_l, TCNT1L
 		in	rcp_time_h, TCNT1H
 		ldi	JE, 3				; ~8000 - ~12000 us timeout
-		mov	rcp_timeout, JE
+		mov	sig_timeout, JE
 		out	SREG, IL
 		reti
 
@@ -636,7 +640,7 @@ rcp_rcp_high_state:					; rising edge detected. start measuring how long it is
 i2c_int:	in	IL, SREG
 		in	JE, TWSR
 		;andi	JE, 0b11111000			; unnecessary for now, these 3 bits are 0 anyway
-
+		;led 1, 0
 		; Check I2C status register, see what happened. See Atmega datasheet for more info.
 		cpi	JE, 0x60			; SR: SLA+W received, ACK returned
 		breq	i2c_sla_w_rec
@@ -651,56 +655,109 @@ i2c_int:	in	IL, SREG
 		cpi	JE, 0x90			; SR: Data after general call received, ACK returned
 		breq	i2c_data_rec
 		tst	JE
-		breq	i2c_bus_error
-		
+		breq	i2c_bus_errorj
+
 		; Unhandled operations (handled by i2c_reset); Slave receiver: 0x68, 0x78, 0x88, 0x98, 0xA0
 		; Slave transmitter: 0xB0, 0xC0, 0xC8
-i2c_reset:	ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
-		out	TWCR, JE			; Switch to unadressed mode
-		clr	IH
-		;sts	power_signal_l, IH
-		;sts	power_signal_h, IH
-		out	SREG, IL
-		reti
-		
+i2c_reset:	rjmp	i2c_send_ack
+i2c_bus_errorj:	rjmp	i2c_bus_error			; Too long jump
+
 		; SR: We have received our slave address, with direction bit set to Slave Receiver
 		; We'll be receiving data now
-i2c_sla_w_rec:	ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
-		out	TWCR, JE			; ACK it
-		out	SREG, IL
-		reti
+i2c_sla_w_rec:	cbr	flags2, 1<<SIGNAL_AWAITING
+		rjmp	i2c_send_ack
 
-		; SR: If data has been received
-i2c_data_rec:	in	IH, TWDR
-		sts	power_signal_l, IH
-		clr	IH
-		sts	power_signal_h, IH
-		ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
-		out	TWCR, JE
+		; SR: If data has been received	
+.if I2C_PROTOCOL == 2
+i2c_data_rec:	in	JH, TWDR
+		bst	flags2, SIGNAL_AWAITING
+		brts	i2c_dt_pow_l
+		mov	JL, JH
+		andi	JL, 0b11110000			; Extract packet header
+		cpi	JL, 0x10			; Power
+		breq	i2c_dt_pow_h
+		cpi	JL, 0x20
+		breq	i2c_dt_resp_type
+		rjmp	i2c_send_ack
+
+		; SR, data: Power packet header received
+i2c_dt_pow_h:	andi	JH, 0b00001111
+		sts	i2c_tmp1, JH			; Store the 4 bits of high byte
+		sbr	flags2, 1<<SIGNAL_AWAITING	; Await the next byte
+		rjmp	i2c_send_ack
+
+		; SR, data: Power packet low byte received
+i2c_dt_pow_l:	sts	power_signal_l, JH
+		lds	JH, i2c_tmp1
+		sts	power_signal_h, JH
 		sbr	flags2, 1<<SIGNAL_READY
 		cbr	flags2, 1<<SIGNAL_ERROR
 		ldi	JE, 25				; ~ 100 ms timeout
-		mov	rcp_timeout, JE
-		out	SREG, IL
-		reti
-			
+		mov	sig_timeout, JE
+		rjmp	i2c_send_ack
+
+		; SR, data: Master sets Slave's response type
+i2c_dt_resp_type:
+		andi	JH, 0b00001111
+		cpi	JH, 0x1
+		breq	i2c_dt_rt_stat
+		cpi	JH, 0x2
+		breq	i2c_dt_rt_spd
+		;cbr	flags3, (1<<I2C_RESPOND_STATUS) | (1<<I2C_RESPOND_SPEED)
+		rjmp	i2c_send_ack
+
+		; SR, data: Master sets Slave's response type to Speed
+i2c_dt_rt_spd:	sbr	flags3, 1<<I2C_RESPOND_SPEED
+		cbr	flags3, 1<<I2C_RESPOND_STATUS
+		rjmp	i2c_send_ack
+		
+		; SR, data: Master sets Slave's response type to Status
+i2c_dt_rt_stat:	sbr	flags3, 1<<I2C_RESPOND_STATUS
+		cbr	flags3, 1<<I2C_RESPOND_SPEED
+		rjmp	i2c_send_ack
+
+.elif I2C_PROTOCOL == 1
+i2c_data_rec:	in	JL, TWDR
+		sts	power_signal_l, JL
+		clr	JL
+		sts	power_signal_h, JL
+		sbr	flags2, 1<<SIGNAL_READY
+		cbr	flags2, 1<<SIGNAL_ERROR
+		ldi	JE, 25				; ~ 100 ms timeout
+		mov	sig_timeout, JE
+		rjmp	i2c_send_ack
+.endif
 		; ST: We have received our slave address, with direction bit set to Slave Transmitter
 		; We'll be transmitting data now
-i2c_sla_r_rec:	lds	JE, rpm_h
-		sts	i2c_rpm_h, JE
-		lds	JE, rpm_l
-		out	TWDR, JE
-		ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
-		out	TWCR, JE			; ACK it
-		out	SREG, IL
-		reti
+i2c_sla_r_rec:	bst	flags3, I2C_RESPOND_SPEED
+		brts	i2c_send_speed_h
+		bst	flags3, I2C_RESPOND_STATUS
+		brts	i2c_send_stat
+		rjmp	i2c_send_ack
 
-i2c_data_sent:	lds	JE, i2c_rpm_h
+		; Data byte has been sent in SLave Transmitter mode
+i2c_data_sent:	bst	flags3, I2C_RESPOND_SPEED
+		brtc	i2c_send_ack
+		lds	JE, i2c_tmp1			; Send the low Speed byte	
 		out	TWDR, JE
-		ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
-		out	TWCR, JE			; ACK it
-		out	SREG, IL
-		reti
+		rjmp	i2c_send_ack
+
+i2c_send_stat:	clr	JE				; Send Status
+		bst	flags, STARTUP
+		bld	JE, 0
+		bst	flags, RUN
+		bld	JE, 1
+		bst	flags, READY
+		bld	JE, 2
+		out	TWDR, JE
+		rjmp	i2c_send_ack
+
+i2c_send_speed_h:					; Send the high Speed byte
+		lds	JE, rpm_l
+		sts	i2c_tmp1, JE
+		lds	JE, rpm_h
+		out	TWDR, JE
+		rjmp	i2c_send_ack
 
 		; Bus error has occured
 i2c_bus_error:	ldi	JE, (1<<TWSTO) | (1<<TWINT)
@@ -710,13 +767,18 @@ i2c_bus_error:	ldi	JE, (1<<TWSTO) | (1<<TWINT)
 		sbr	flags2, 1<<SIGNAL_ERROR
 		out	SREG, IL
 		reti
+
+i2c_send_ack:	ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
+		out	TWCR, JE			; ACK it
+		out	SREG, IL
+		reti
 .endif
-		
-signal_err:
-		clr	rcp_fail_count
+
+signal_err:	clr	rcp_fail_count
 		sbr	flags2, (1<<SIGNAL_READY) | (1<<SIGNAL_ERROR)
-		cbr	flags2, 1<<RCP_AWAITING_L
-signal_power_off:	clr	JL
+		cbr	flags2, 1<<SIGNAL_AWAITING
+signal_power_off:
+		clr	JL
 		sts	power_signal_l, JL
 		sts	power_signal_h, JL
 		out	SREG, IL
@@ -1073,20 +1135,20 @@ bp_lp:		sbrs	flags2, BEEP_CYCLE		; wait for timer to give a signal for single cy
 		rcall	delay_8cycles
 		TY_off
 		wdr
-bp_ct:		sbrs	flags, TIMER_READY		; check timer. if it's ready, break the loop
+bp_ct:		sbrs	flags3, TIMER_READY		; check timer. if it's ready, break the loop
 		rjmp	bp_lp
 		in	XL, TIMSK
 		cbr	XL, 1<<OCIE1B
 		out	TIMSK, XL
-		rcall	motor_free_run
-		sbrc	flags, BRAKED
-		rcall	motor_brake
 		cbr	flags2, 1<<BEEPER		; give it some time for demagnetization not to destroy the fet with inductive kickback
 		ldi	XL, low(CLOCK_MHZ*1000000/1000/333)	; 3 ms
 		ldi	XH, high(CLOCK_MHZ*1000000/1000/333)
 		rcall	delay_1000cycles
 		wdr
 		RX_off
+		rcall	motor_free_run
+		sbrc	flags, BRAKED
+		rcall	motor_brake
 		ret
 
 ; args: time[ms], freq[hz]. If frequency given 0, DH:DL will be used
@@ -1315,13 +1377,13 @@ start_set_commutation_timeout:
 ; It returns the comparator state right from before the output pwm goes high.
 ; The point is to reduce the influence of coil demagnetization and other noise sources.
 start_read_comparator_state:
-		sbrc	flags, TIMER_READY		; check if timeout
+		sbrc	flags3, TIMER_READY		; check if timeout
 		ret					; yes
 		bst	flags, SDM_STATE
 		brts	start_read_comparator_state	; high pwm state? wait for low.
 		clr	XH				; should be low pwm state now
 srcs_loop:						; now wait for high state
-		sbrc	flags, TIMER_READY		; timeout?
+		sbrc	flags3, TIMER_READY		; timeout?
 		ret					; yes
 		mov	XL, XH				; save previous read comparator state
 		in	XH, ACSR			; read comparator register
@@ -1331,7 +1393,7 @@ srcs_loop:						; now wait for high state
 		ret					; no
 
 start_wait_bemf_low:
-		sbrc	flags, TIMER_READY		; check if timeout
+		sbrc	flags3, TIMER_READY		; check if timeout
 		ret					; yes, return
 		rcall	start_read_comparator_state	; no
 		ldi	XH, (1<<ACO)
@@ -1340,7 +1402,7 @@ start_wait_bemf_low:
 		ret
 
 start_wait_bemf_high:
-		sbrc	flags, TIMER_READY		; check if timeout
+		sbrc	flags3, TIMER_READY		; check if timeout
 		ret					; yes
 		rcall	start_read_comparator_state
 		clr	XH
@@ -1352,20 +1414,20 @@ start_wait_bemf_high:
 ; wait for zero cross high->low (or timeout)
 start_wait_zc_low:
 		rcall	start_wait_bemf_high
-		sbrc	flags, TIMER_READY
+		sbrc	flags3, TIMER_READY
 		rjmp	swz_to
 		rcall	start_wait_bemf_low
-		sbrs	flags, TIMER_READY
+		sbrs	flags3, TIMER_READY
 		ret
 		rjmp	swz_to
 
 ; wait for zero cross low->high (or timeout)
 start_wait_zc_high:
 		rcall	start_wait_bemf_low
-		sbrc	flags, TIMER_READY
+		sbrc	flags3, TIMER_READY
 		rjmp	swz_to
 		rcall	start_wait_bemf_high
-		sbrs	flags, TIMER_READY		; timeout?
+		sbrs	flags3, TIMER_READY		; timeout?
 swz_ret:	ret					; no, just ret
 swz_to:		lds	XL, startup_forced_com_num
 		dec	XL				; there is some number of forced commutations allowed
@@ -1375,11 +1437,12 @@ swz_to:		lds	XL, startup_forced_com_num
 		pop	XL				; remove 16 bit return address from stack
 		rjmp	start_up_again			; go to the start
 
-start_reset_counters:
+startup_quit:
 		ldi	XL, START_UP_COUNTER+1		; set number of commutations that must be done sucessfully in start
 		sts	startup_counter, XL
 		ldi	XL, STARTUP_FORCED_COM_NUMBER	; set number of commutations to be forced if no zc is detected in time
 		sts	startup_forced_com_num, XL
+		cbr	flags, (1<<STARTUP) | (1<<RUN)
 		ret
 
 start_handle_signal:
@@ -1390,8 +1453,7 @@ start_handle_signal:
 		brne	shs_ret				; non-zero? just return
 		pop	XL				; was zero, return to main loop
 		pop	XL
-		rcall	start_reset_counters
-		cbr	flags, 1<<STARTUP
+		rcall	startup_quit
 shs_ret:	ret
 
 ; start up procedure
@@ -1637,7 +1699,7 @@ run_process_zc: cbi	ACSR, ACIE			; Disable comparator interrupts
 		adc	XH, BH
 		adc	YL, AH
 		cli
-		sbr	flags, 1<<TIMER_COMMUTATE	; make the timer call the next commutation function
+		sbr	flags3, 1<<TIMER_COMMUTATE	; make the timer call the next commutation function
 		rcall	timer_set			; launch the timer
 
 		; --- Step 4. Other calculations ---
@@ -1693,16 +1755,41 @@ run_tim_ang_ok:
 
 run_power_ok:	movw	sdm_factor_l, XL		; Set the outgoing power
 				
+		lds	XL, avg_com_len_l
+		lds	XH, avg_com_len_h
+		lds	YL, avg_com_len_e
+		movw	AL, XL
+		mov	BL, YL
+		lsl	XL
+		rol	XH
+		rol	YL
+		add	AL, XL
+		adc	AH, XH
+		adc	BL, YL
+		lds	XL, com_length_l
+		lds	XH, com_length_h
+		lds	YL, com_length_e
+		add	AL, XL
+		adc	AH, XH
+		adc	BL, YL
+		ror	BL
+		ror	AH
+		ror	AL
+		lsr	BL
+		ror	AH
+		ror	AL
+		sts	avg_com_len_l, AL
+		sts	avg_com_len_h, AH
+		sts	avg_com_len_e, BL
+
 		; Cycle time -> RPM conversion. Since f = 1/T, we have to make a division here.
 		; Unfortunately the AVR processor doesn't have it. This is a 32 by 24 bit division, speed-optimized.
 		; Shouldn't take more than 300 cycles. We don't have to hurry that much anyway, we can always stop the
 		; calculation, handle the necessary stuff, and get back to it.
 		; Inspired by this code: http://www.mikrocontroller.net/articles/AVR_Arithmetik#32_Bit_.2F_32_Bit
+
 		bst	flags3, UPDATE_RPM
 		;brtc	run_rpm_done
-		lds	AL, com_length_l
-		lds	AH, com_length_h
-		lds	BL, com_length_e
 		ldi	XL, byte1(TICKS_PER_SEC/6)
 		ldi	XH, byte2(TICKS_PER_SEC/6)
 		ldi	YL, byte3(TICKS_PER_SEC/6)
@@ -1861,35 +1948,6 @@ reset:
 		 .endif
 		.endif
 
-reset_chk_wdr:	sbrs	IL, WDRF
-		rjmp	reset_chk_bo
-		;rcall	beep_wdr			; watchdog reset occured
-		led	1, 1
-		rjmp	reset_chk_done
-
-reset_chk_bo:	sbrs	IL, BORF		
-		rjmp	reset_chk_ext
-		;rcall	beep_bo				; brown-out occured
-		led	1, 1
-		rjmp	reset_chk_done		
-		
-reset_chk_ext:	sbrs	IL, EXTRF
-		rjmp	reset_chk_po
-		;rcall	beep_extr
-		led	1, 1
-		led	0, 1
-		rjmp	reset_chk_done
-
-reset_chk_po:	sbrc	IL, PORF
-		rjmp	reset_ok
-		led	1, 1
-		led	0, 1
-		;rcall	beep_single			; uncrecognized reset reason, no flag set. wtf?
-		rjmp	reset_chk_done
-
-reset_ok:	;rcall	beep_po				; normal power on start occured
-
-reset_chk_done:
 		led	0, 1
 		led	1, 1
 		ldi	XL, low(CLOCK_MHZ*1000000/20/1000)	; wait 50 ms
@@ -1938,7 +1996,7 @@ reset_clr_lp:	st	X+, YL				; clear ram variables
 		; watchdog
 		ldi	XL, 1<<WDE			; enable watchdog, with no proescaler, ~16ms
 		out	WDTCR, XL
-		cbr	flags, 1<<TIMER_COMMUTATE
+		cbr	flags3, 1<<TIMER_COMMUTATE
 			
 		ldi	XL, low(commutation_01)		; set the first commutation function address
 		ldi	XH, high(commutation_01)
@@ -1947,11 +2005,41 @@ reset_clr_lp:	st	X+, YL				; clear ram variables
 		
 		sei					; enable interrupts
 
+reset_chk_wdr:	sbrs	IL, WDRF
+		rjmp	reset_chk_bo
+		;rcall	beep_wdr			; watchdog reset occured
+		led	1, 1
+		rjmp	reset_chk_done
+
+reset_chk_bo:	sbrs	IL, BORF		
+		rjmp	reset_chk_ext
+		;rcall	beep_bo				; brown-out occured
+		led	1, 1
+		rjmp	reset_chk_done		
+		
+reset_chk_ext:	sbrs	IL, EXTRF
+		rjmp	reset_chk_po
+		;rcall	beep_extr
+		led	1, 1
+		led	0, 1
+		rjmp	reset_chk_done
+
+reset_chk_po:	sbrc	IL, PORF
+		rjmp	reset_ok
+		led	1, 1
+		led	0, 1
+		;rcall	beep_single			; uncrecognized reset reason, no flag set. wtf?
+		rjmp	reset_chk_done
+
+reset_ok:	;rcall	beep_po				; normal power on start occured
+
+reset_chk_done:
+		led	1, 0
 		rjmp	ml_res_sig_cnt
 ; Main loop
-main_loop:	led	1, 0
+main_loop:	
 		wdr
-		bst	flags, TIMER_READY		; is the timer ready (not counting)?
+		bst	flags3, TIMER_READY		; is the timer ready (not counting)?
 		brtc	ml_timer_done			; no, it's working already
 		run_timer 100*TICKS_PER_MS		; set it
 		lds	XL, loop_led_cnt
@@ -1978,14 +2066,14 @@ ml_sig_fine:	rcall	motor_free_run			; no error, unbrake the motor
 		adiw	XL, 0				; test if non-zero
 		breq	ml_sig_done			; zero, jump
 		
-		led	0, 1
+		;led	0, 1
 		lds	XL, signal_cnt			; non-zero, load the signal counter
 		dec	XL
 		sts	signal_cnt, XL			
 		brne	ml_sig_done
 		led	0, 0
 		rcall	start_up			; start up
-
+		sbr	flags, 1<<READY
 ml_res_sig_cnt:	ldi	XL, 3				; reset down-counter of good signals the controller
 		sts	signal_cnt, XL			; must receive to start. accidental start prevention.
 		

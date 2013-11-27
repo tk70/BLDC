@@ -5,9 +5,10 @@
 ; clock frequency [MHz]
 .equ CLOCK_MHZ = 16
 
-.equ CONTROL_METHOD = 2					; 1 - RC pulse, 2 - I2C (coming soon)
+.equ CONTROL_METHOD = 2					; 1 - RC pulse, 2 - I2C
 
 .equ I2C_SLAVE_ADDRESS = 4
+.equ I2C_PROTOCOL = 2					; 1 - basic, 2 - extended
 
 ; if rc pulse used
 .equ RCP_CHANNEL = 0
@@ -26,7 +27,6 @@
 
 .equ R_COMP_CHANNEL	= 0				; phase comparator channel (port C)
 
-
 ; phase S
 .equ SL_PIN =		PD3
 .equ SL_PORT =		PORTD
@@ -37,7 +37,6 @@
 .equ SH_DDR =		DDRB
 
 .equ S_COMP_CHANNEL	= 1
-
 
 ; phase T
 .equ TL_PIN	=	PD4
