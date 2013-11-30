@@ -64,8 +64,6 @@
 .equ POWER_RANGE_L = low(POWER_RANGE)
 .equ POWER_RANGE_H = high(POWER_RANGE)
 
-
-
 .equ GOV_SPEED_CONST = POWER_RANGE * TICKS_PER_SEC / GOV_MAX_RPS / 6 ; 6 - 6 commutations per cycle
 ;.equ STARTUP_PULL_POWER_L = low(STARTUP_PULL_POWER*TICKS_PER_US)
 ;.equ STARTUP_PULL_POWER_H = high(STARTUP_PULL_POWER*TICKS_PER_US)
@@ -74,6 +72,9 @@
 .equ STARTUP_MIN_POWER_L = low(POWER_RANGE*STARTUP_MIN_POWER/100)
 .equ STARTUP_MIN_POWER_H = high(POWER_RANGE*STARTUP_MIN_POWER/100)
 .equ STARTUP_COM_TIMEOUT = 1000000*10*TICKS_PER_US/STARTUP_MIN_RPM
+.equ STARTUP_SPEED_STEP = STARTUP_RPM_STEP * STARTUP_COM_TIMEOUT / 100;
+.equ STARTUP_COM_T_MIN = 1000000*10*TICKS_PER_US/STARTUP_MAX_RPM
+
 
 .equ COM_DELAY = 128 - TIMING_ADVANCE
 
@@ -169,6 +170,9 @@
 	com_length_l:		.byte	1		; commutation length
 	com_length_h:		.byte	1
 	com_length_e:		.byte	1
+	startup_com_time_l:	.byte	1
+	startup_com_time_h:	.byte	1
+	startup_com_time_e:	.byte	1
 	previous_zc_time_l:	.byte	1		; time of the previous zero cross detection
 	previous_zc_time_h:	.byte	1
 	previous_zc_time_e:	.byte	1
@@ -409,7 +413,7 @@ timer_set:	ldi	DL, 1<<OCF1A
 		rjmp	ts_ret				; nah. the time hasn't come yet
 		sbr	flags3, 1<<TIMER_READY		; yes. time delta is above mid timer value, meaning time of compare match has passed already. set ready flag
 		sbrc	flags3, TIMER_COMMUTATE		; the timer has to call the commutation?
-		rjmp	timer_switch_commutation	; yes
+		rjmp	tim_switch_com			; yes
 ts_ret:		reti					; no, enable interrupts and return (reti = sei + ret)
 
 
@@ -448,8 +452,7 @@ timer_ocr1a_int:
 		sbrs	flags3, TIMER_COMMUTATE		; the timer has to call the commutation?
 		rjmp	reti_sreg_restore		; no, it doesn't
 
-timer_switch_commutation:		
-		lds	ZL, next_comm_call_addr_l	; load the function pointer to be called
+tim_switch_com:	lds	ZL, next_comm_call_addr_l	; load the function pointer to be called
 		lds	ZH, next_comm_call_addr_h
 		icall					; call the commutation function
 		wdr
@@ -460,7 +463,7 @@ timer_switch_commutation:
 		; Otherwise the comparator will trigger the interrupts too early because of some noises and the motor
 		; will lose sync.
 		; Timer2 will keep scanning the comparator until the pre-ZC state occurs.
-		ldi	JE, 190				; set the timer to trigger interrupt in 65 cycles
+ti_pre_zc_scan:	ldi	JE, 190				; set the timer to trigger interrupt in 65 cycles
 		out	TCNT2, JE
 		ldi	JE, 1<<TOV2			; clear pending interrupt
 		out	TIFR, JE
@@ -495,7 +498,8 @@ t_sig_fail:	rjmp	signal_err
 ; This code is a temporary fix for motor sync losses on low RPMs which happened due to errorneous,
 ; too early detections. I plan to make it also comparator interrupt driven, instead of timer-sampled.
 t2_ovf_int:	in	IL, SREG
-		sbic	ACSR, ACIS0
+		clt
+t2_type_check:	sbic	ACSR, ACIS0
 		rjmp	t2_scan_for_low_state
 t2_scan_for_high_state:
 		sbis	ACSR, ACO
@@ -505,12 +509,16 @@ t2_scan_for_low_state:
 		sbic	ACSR, ACO
 		rjmp	t2_set_again
 		
+t2_set_aco:	brts	t2_set_aco2			; T set? it's already been the 2nd check, move on
+		set
+		rjmp	t2_type_check			; Check one more time to confirm
+
 		; Pre ZC state detected.
 		; Activate the zero crossing scan.
 		; First, set the timeout for the operation.
-t2_set_aco:	in	JL, TCNT1L
+t2_set_aco2:	in	JL, TCNT1L
 		in	JH, TCNT1H
-		lds	JE, zc_timeout_l		; load calculated timeout for ZC
+		lds	JE, zc_timeout_l		; Load calculated timeout for ZC
 		add	JL, JE
 		lds	JE, zc_timeout_h
 		adc	JH, JE
@@ -533,6 +541,7 @@ t2_set_aco:	in	JL, TCNT1L
 		led	0, 0
 		reti
 
+		; No proper pre-ZC state detected
 		; Set this intrrupt to trigger again in 65 cycles
 t2_set_again:	ldi	JE, 190
 		out	TCNT2, JE
@@ -1363,14 +1372,26 @@ sdm_h4:	.if ACTIVE_FREEWHEELING
 
 ; calculate commutation timeout
 start_set_commutation_timeout:
-		ldi	XL, byte1(STARTUP_COM_TIMEOUT)
-		ldi	XH, byte2(STARTUP_COM_TIMEOUT)
-		ldi	YL, byte3(STARTUP_COM_TIMEOUT)
-		lti	AL, AH, BL, DL, 1
-		add	XL, AL
-		adc	XH, AH
-		adc	YL, BL
-		rjmp	timer_set
+		lds	XL, startup_com_time_l
+		lds	XH, startup_com_time_h
+		lds	YL, startup_com_time_e
+		subi	XL, byte1(STARTUP_SPEED_STEP)
+		sbci	XH, byte2(STARTUP_SPEED_STEP)
+		sbci	YL, byte3(STARTUP_SPEED_STEP)
+		brmi	start_sc_ovf
+		cpi	XL, byte1(STARTUP_COM_T_MIN)
+		ldi	YH, byte2(STARTUP_COM_T_MIN)
+		cpc	XH, YH
+		ldi	YH, byte3(STARTUP_COM_T_MIN)
+		cpc	YL, YH
+		brsh	start_sc_store
+start_sc_ovf:	ldi	XL, byte1(STARTUP_COM_T_MIN)
+		ldi	XH, byte2(STARTUP_COM_T_MIN)
+		ldi	YL, byte3(STARTUP_COM_T_MIN)
+start_sc_store:	sts	startup_com_time_l, XL
+		sts	startup_com_time_h, XH
+		sts	startup_com_time_e, YL
+		rjmp	timer_set_relative
 
 ; Return comparator state.
 ; This function used during startup is different than the one used during run.
@@ -1437,8 +1458,7 @@ swz_to:		lds	XL, startup_forced_com_num
 		pop	XL				; remove 16 bit return address from stack
 		rjmp	start_up_again			; go to the start
 
-startup_quit:
-		ldi	XL, START_UP_COUNTER+1		; set number of commutations that must be done sucessfully in start
+startup_quit:	ldi	XL, START_UP_COUNTER+1		; set number of commutations that must be done sucessfully in start
 		sts	startup_counter, XL
 		ldi	XL, STARTUP_FORCED_COM_NUMBER	; set number of commutations to be forced if no zc is detected in time
 		sts	startup_forced_com_num, XL
@@ -1457,28 +1477,43 @@ start_handle_signal:
 shs_ret:	ret
 
 ; start up procedure
+start_up:
 start_up_again:	lds	XL, startup_attempts
 		inc	XL
 		sts	startup_attempts, XL
-start_up:	clr	XL				; reset some vars in case we just quit running mode
+		clr	XL				; reset some vars in case we just quit running mode
 		sts	rpm_l, XL
 		sts	rpm_h, XL
 		in	XL, TIMSK			; disable timer2 interrupt
 		cbr	XL, 1<<TOIE2
 		out	TIMSK, XL
+		cbi     ACSR, ACIS1
 		rcall	start_handle_signal
+		ldi	XL, byte1(STARTUP_COM_TIMEOUT)
+		ldi	XH, byte2(STARTUP_COM_TIMEOUT)
+		ldi	YL, byte3(STARTUP_COM_TIMEOUT)
+		sts	startup_com_time_l, XL
+		sts	startup_com_time_h, XH
+		sts	startup_com_time_e, YL
 		sbr	flags, (1<<STARTUP)
 		cbr	flags, (1<<RUN)
 		rcall	commutate
 		rcall	commutate
 		rcall	sdm_on				; activate sigma-delta generator
-
 start_loop:	rcall	start_handle_signal
 		sts	previous_zc_time_l, BL		; store the time of the previous ZC. these variables need to be
 		sts	previous_zc_time_h, BH		; set properly in case it switched to running mode right after
 		sts	previous_zc_time_e, CL
+		
+		lds	XL, startup_counter
+		set;bst	XL, 0
+		brts	su_pow
+		clr	XL
+		clr	XH
+		movw	sdm_factor_l, XL
+		rjmp	su_pow_ok
 
-		ldi	YH, STARTUP_MAX_POWER_H
+su_pow:		ldi	YH, STARTUP_MAX_POWER_H
 		cpi	XL, STARTUP_MAX_POWER_L		; compare the power value with max allowed start-up power
 		cpc	XH, YH
 		brsh	su_lpu				; higher? limit power (up)
@@ -1553,7 +1588,9 @@ running_mode_switch:
 		lsl	XL
 		rol	XH
 		rol	YL
-		rcall	timer_set_relative		; Set the timer	
+		sts	zc_timeout_l, XL
+		sts	zc_timeout_h, XH
+		sts	zc_timeout_e, YL
 
 		clr	XL				; Clear some other stuff
 		sts	timing_angle, XL
@@ -1562,16 +1599,14 @@ running_mode_switch:
 		rcall	update_power
 	
 		
-		; Config the comparator
-		sbi	ACSR, ACIS1			; This one always must be set (triggers on logic change)
-		sbi	ACSR, ACI			; Clear pending interrupt (if there is one)
-		nop
-		ldi	XL, 32
-		ldi	XL, 0
-		rcall	delay_8cycles
-		sbi	ACSR, ACIE			; Enable interrupts
-		
-		rjmp	run_wait_zc_timeout		; Everything is set now. Await ZC timeout.
+		 ; Config the comparator
+                sbi        ACSR, ACIS1                  ; This one always must be set (triggers on logic change)
+
+		; Activate th first interrupt driven pre-ZC and ZC scan
+		cli					; Calling interrupt subroutine here
+		in	IL, SREG			; Need to set it because it's restored from IL there
+		rcall	ti_pre_zc_scan
+		rjmp	run_wait_zc_timeout		; Everything is set now. Await ZC timeout.*/
 
 
 ; ---- Step 1. Zero Crossing detection ---
