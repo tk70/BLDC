@@ -18,7 +18,7 @@
 ; - hardware checks
 ; - beeps (unfinished yet)
 
-.include "n11a01.inc"
+.include "n11c01.inc"
 ;.include "mybldc.inc"
 .include "bldc.inc"
 
@@ -766,30 +766,27 @@ i2c_send_speed_h:					; Send the high Speed byte
 		sts	i2c_tmp1, JE
 		lds	JE, rpm_h
 		out	TWDR, JE
-		rjmp	i2c_send_ack
-
-		; Bus error has occured
-i2c_bus_error:	ldi	JE, (1<<TWSTO) | (1<<TWINT)
-		clr	IH				; Release the I2C lines allowing onther devices to work
-		sts	power_signal_l, IH
-		sts	power_signal_h, IH
-		sbr	flags2, 1<<SIGNAL_ERROR
-		out	SREG, IL
-		reti
+		; go down
 
 i2c_send_ack:	ldi	JE, (1<<TWIE) | (1<<TWINT) | (1<<TWEA) | (1<<TWEN)
 		out	TWCR, JE			; ACK it
 		out	SREG, IL
 		reti
+
+		; Bus error has occured
+i2c_bus_error:	ldi	JE, (1<<TWSTO) | (1<<TWINT)
+		out	TWCR, JE			; Release the I2C lines allowing onther devices to work
+		; go down
 .endif
 
 signal_err:	clr	rcp_fail_count
 		sbr	flags2, (1<<SIGNAL_READY) | (1<<SIGNAL_ERROR)
 		cbr	flags2, 1<<SIGNAL_AWAITING
 signal_power_off:
-		clr	JL
-		sts	power_signal_l, JL
-		sts	power_signal_h, JL
+		clr	sdm_factor_l
+		clr	sdm_factor_h
+		sts	power_signal_l, sdm_factor_l
+		sts	power_signal_h, sdm_factor_h
 		out	SREG, IL
 		reti
 
@@ -818,13 +815,6 @@ up_np:		clr	XL				; if no signal or power zero
 		.endif
 		ret
 
-handle_signal_error:
-		sbrc	flags, SDM_ACTIVE
-		rcall	sdm_off
-		sbrs	flags, BRAKED
-		rjmp	motor_brake
-
-
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; |                                                    Power stage                                                    |
 ; *-------------------------------------------------------------------------------------------------------------------*
@@ -833,91 +823,93 @@ handle_signal_error:
 .if PWM_SIDE == 1					; low side does the PWM
 	; phase R
 	.macro	RX_on
-		;nop
-		sbi	RL_PORT, RL_PIN
+		;sbi	RL_PORT, RL_PIN
+		set_pin	RL_PORT, RL_PIN, !RL_INVERTING
 	.endmacro
 	.macro	RX_off
-		cbi	RL_PORT, RL_PIN
+		;cbi	RL_PORT, RL_PIN
+		set_pin	RL_PORT, RL_PIN, RL_INVERTING
 	.endmacro
 	.macro	RY_on
-		;nop
-		sbi	RH_PORT, RH_PIN
+		;sbi	RH_PORT, RH_PIN
+		set_pin	RH_PORT, RH_PIN, !RH_INVERTING
 	.endmacro
 	.macro	RY_off
-		cbi	RH_PORT, RH_PIN
+		;cbi	RH_PORT, RH_PIN
+		set_pin	RH_PORT, RH_PIN, RH_INVERTING
 	.endmacro
 
 	; phase S
 	.macro	SX_on
 		;nop
-		sbi	SL_PORT, SL_PIN
+		set_pin	SL_PORT, SL_PIN, !SL_INVERTING
 	.endmacro
 	.macro	SX_off
-		cbi	SL_PORT, SL_PIN
+		set_pin	SL_PORT, SL_PIN, SL_INVERTING
 	.endmacro
 	.macro	SY_on
 		;nop
-		sbi	SH_PORT, SH_PIN
+		set_pin	SH_PORT, SH_PIN, !SH_INVERTING
 	.endmacro
 	.macro	SY_off
-		cbi	SH_PORT, SH_PIN
+		set_pin	SH_PORT, SH_PIN, SH_INVERTING
 	.endmacro
 
 	; phase T
 	.macro	TX_on
 		;nop
-		sbi	TL_PORT, TL_PIN
+		set_pin	TL_PORT, TL_PIN, !TL_INVERTING
 	.endmacro
 	.macro	TX_off
-		cbi	TL_PORT, TL_PIN
+		set_pin	TL_PORT, TL_PIN, TL_INVERTING
 	.endmacro
 	.macro	TY_on
 		;nop
-		sbi	TH_PORT, TH_PIN
+		set_pin	TH_PORT, TH_PIN, !TH_INVERTING
 	.endmacro
 	.macro	TY_off
-		cbi	TH_PORT, TH_PIN
+		set_pin	TH_PORT, TH_PIN, TH_INVERTING
 	.endmacro
 .else							; high side does the PWM
 	.macro	RX_on
-		sbi	RH_PORT, RH_PIN
+		set_pin	RH_PORT, RH_PIN, !RH_INVERTING
 	.endmacro
 	.macro	RX_off
-		cbi	RH_PORT, RH_PIN
+		set_pin	RH_PORT, RH_PIN, RH_INVERTING
 	.endmacro
 	.macro	RY_on
-		sbi	RL_PORT, RL_PIN
+		set_pin	RL_PORT, RL_PIN, !RL_INVERTING
 	.endmacro
 	.macro	RY_off
-		cbi	RL_PORT, RL_PIN
+		set_pin	RL_PORT, RL_PIN, RL_INVERTING
 	.endmacro
 
 	; phase S
 	.macro	SX_on
-		sbi	SH_PORT, SH_PIN
+		set_pin	SH_PORT, SH_PIN, !SH_INVERTING
 	.endmacro
 	.macro	SX_off
-		cbi	SH_PORT, SH_PIN
+		set_pin	SH_PORT, SH_PIN, SH_INVERTING
 	.endmacro
 	.macro	SY_on
-		sbi	SL_PORT, SL_PIN
+		set_pin	SL_PORT, SL_PIN, !SL_INVERTING
 	.endmacro
 	.macro	SY_off
-		cbi	SL_PORT, SL_PIN
+		set_pin	SL_PORT, SL_PIN, SL_INVERTING
 	.endmacro
 
 	; phase T
 	.macro	TX_on
-		sbi	TH_PORT, TH_PIN
+		set_pin	TH_PORT, TH_PIN, !TH_INVERTING
 	.endmacro
 	.macro	TX_off
-		cbi	TH_PORT, TH_PIN
+		set_pin	TH_PORT, TH_PIN, TH_INVERTING
 	.endmacro
 	.macro	TY_on
-		sbi	TL_PORT, TL_PIN
+		set_pin	TL_PORT, TL_PIN, !TL_INVERTING
 	.endmacro
 	.macro	TY_off
-		cbi	TL_PORT, TL_PIN
+		set_pin	TL_PORT, TL_PIN, TL_INVERTING
 	.endmacro
 .endif
 
@@ -928,14 +920,34 @@ fet_delay:	nop
 		nop
 		ret
 
-.macro	fets_off
+.macro	yfets_off
 		RY_off
 		SY_off		
 		TY_off
+.endmacro
+
+.macro	xfets_off
 		RX_off
 		SX_off
 		TX_off
 .endmacro
+
+.macro	fets_off
+		yfets_off
+		xfets_off
+.endmacro
+
+handle_signal_error:
+		sbrc	flags, SDM_ACTIVE
+		rcall	sdm_off
+		xfets_off
+		ldi	XL, low(CLOCK_MHZ*1000000/1000/1000)	; 1 ms
+		ldi	XH, high(CLOCK_MHZ*1000000/1000/1000)
+		rcall	delay_1000cycles
+		yfets_off
+		;sbrs	flags, BRAKED
+		;rjmp	motor_brake
+		ret
 
 ; cuts the power off, all power FETs closed
 motor_free_run:	rcall	sdm_off				; sdm generator off, so it doesn't open the FETs
@@ -1206,8 +1218,6 @@ beep_po:	led	0, 1
 
 ; Watchdog reset occured. Fail sound
 beep_wdr:	led	0, 1
-		beep_sound 133,	(BPF_E6/4)
-		rcall	beep_delay_16
 		beep_sound 133,	(BPF_Eb6/4)
 		rcall	beep_delay_16
 		beep_sound 170,	(BPF_D6/4)
@@ -1273,6 +1283,8 @@ sdm_off:	in	XH, TIMSK
 		cbr	XH, 1<<TOIE0
 		cbr	flags, 1<<SDM_ACTIVE
 		out	TIMSK, XH
+		ldi	XL, 1<<TOV0
+		out	TIFR, XH			; make 100% sure that no delayed interrupt will occur
 		;led_dbg	5, 0
 		ret
 
@@ -1949,6 +1961,7 @@ reset:
 		sbi	SH_DDR, SH_PIN
 		sbi	TL_DDR, TL_PIN
 		sbi	TH_DDR, TH_PIN
+		fets_off
 
 		clr	XH
 		out	SREG, XH			; just in case, it should be 0 after reset
@@ -1957,8 +1970,6 @@ reset:
 		ldi	YH, high(RAMEND)
 		out	SPH, YH
 		out	SPL, YL
-
-		rcall	motor_free_run			; close all fets
 
 		.if	LED_DEBUG			; and LEDs...
 		 .ifdef LED0_PORT
@@ -2031,6 +2042,7 @@ reset_clr_lp:	st	X+, YL				; clear ram variables
 		; watchdog
 		ldi	XL, 1<<WDE			; enable watchdog, with no proescaler, ~16ms
 		out	WDTCR, XL
+
 		cbr	flags3, 1<<TIMER_COMMUTATE
 			
 		ldi	XL, low(commutation_01)		; set the first commutation function address
@@ -2076,8 +2088,11 @@ main_loop:
 		wdr
 		bst	flags3, TIMER_READY		; is the timer ready (not counting)?
 		brtc	ml_timer_done			; no, it's working already
+		run_timer 10*TICKS_PER_MS
+		bst	flags2, SIGNAL_ERROR
+		brts	ml_lnr
 		run_timer 100*TICKS_PER_MS		; set it
-		lds	XL, loop_led_cnt
+ml_lnr:		lds	XL, loop_led_cnt
 		dec	XL
 		brpl	ml_led_off
 		led	0, 1
