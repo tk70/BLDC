@@ -27,7 +27,7 @@
 .equ RH_DDR =		DDRD
 .equ RH_INVERTING =	1
 
-.equ R_COMP_CHANNEL	= 0				; phase comparator channel (port C)
+.equ R_COMP_CHANNEL	= 2				; phase comparator channel (port C)
 
 ; phase S
 .equ SL_PIN =		PD3
@@ -53,7 +53,7 @@
 .equ TH_DDR =		DDRB
 .equ TH_INVERTING =	1
 
-.equ T_COMP_CHANNEL	= 2
+.equ T_COMP_CHANNEL	= 0
 
 .equ LED_DEBUG = 1
 

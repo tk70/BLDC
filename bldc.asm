@@ -32,6 +32,7 @@
 .equ MIN_RPS = MIN_RPM / 60
 .equ MAX_RPS = MAX_RPM / 60
 .equ GOV_MAX_RPS = GOVERNOR_MAX_RPM / 60
+.equ GOV_MIN_RPS = GOVERNOR_MIN_RPM / 60
 
 .if CONTROL_METHOD == 1
 	; If we chose RC pulse as control method
@@ -51,6 +52,10 @@
 		.error	"Invalid constant: RCP_CHANNEL. Please select 0 (external interrupt 0) or 1 (external interrupt 1)"
 	.endif
 	.equ POWER_RANGE = (RCP_MAX_THR - RCP_MIN_THR)*TICKS_PER_US
+	.if byte3(POWER_RANGE) | byte4(POWER_RANGE)
+		.error "16 bit variable overflow in POWER_RANGE. RC pulse length too long?"
+		.exit
+	.endif
 
 .elif CONTROL_METHOD == 2
 	; If we	chose I2C pulse as control method
@@ -61,12 +66,22 @@
 	.endif
 .endif
 
+.equ ST_CONST = THROTTLE_PERCENT_PER_1K_RPM * POWER_RANGE * 256 * 6 / 10000
+.if SPEED_POWER_LIMIT == 1
+	; Calculate the constant which we use to calculate throttle limit based on motor speed
+	; Power limit will be then: RPS * ST_CONST / 256
+
+	.if byte3(ST_CONST) | byte4(ST_CONST)
+		.error "16 bit variable overflow in ST_CONST. Please reduce POWER_RANGE or THROTTLE_PERCENT_PER_1K_RPM"
+		.exit
+	.endif
+	.equ ST_CONST_L = low(ST_CONST)
+	.equ ST_CONST_H = high(ST_CONST)
+.endif
+
 .equ POWER_RANGE_L = low(POWER_RANGE)
 .equ POWER_RANGE_H = high(POWER_RANGE)
 
-.equ GOV_SPEED_CONST = POWER_RANGE * TICKS_PER_SEC / GOV_MAX_RPS / 6 ; 6 - 6 commutations per cycle
-;.equ STARTUP_PULL_POWER_L = low(STARTUP_PULL_POWER*TICKS_PER_US)
-;.equ STARTUP_PULL_POWER_H = high(STARTUP_PULL_POWER*TICKS_PER_US)
 .equ STARTUP_MAX_POWER_L = low(POWER_RANGE*STARTUP_MAX_POWER/100)
 .equ STARTUP_MAX_POWER_H = high(POWER_RANGE*STARTUP_MAX_POWER/100)
 .equ STARTUP_MIN_POWER_L = low(POWER_RANGE*STARTUP_MIN_POWER/100)
@@ -137,6 +152,8 @@
 	.equ BRAKED = 3					; Set if motor is braked
 	.equ STARTUP = 4				; Set if motor is in the starting mode
 	.equ RUN = 5					; Set if motor is in the running mode
+	.equ CUT_POWER = 6
+	.equ PRE_ZC = 7
 
 
 .def flags2 = r24
@@ -144,16 +161,14 @@
 	.equ BEEPER = 2
 	.equ BEEP_CYCLE = 3
 	.equ SIGNAL_AWAITING = 4			; Waiting for falling RC signal edge?
-
 	.equ SIGNAL_READY = 6
 	.equ SIGNAL_ERROR = 7
 
 .def flags3 = r25
-	.equ UPDATE_RPM = 0
-	.equ CYCLE_DONE = 1
+	.equ UPDATE_SPEED = 0
+	.equ GOT_SPEED = 1
 	.equ TIMER_READY = 2
 	.equ TIMER_COMMUTATE = 3			; Should timer call the next commutation?
-	.equ TIMER_START_ZC_SCAN = 4
 	.equ I2C_RESPOND_STATUS = 6
 	.equ I2C_RESPOND_SPEED = 7			; Respond with speed when entring Slave Transmitter mode?
 	
@@ -176,11 +191,15 @@
 	previous_zc_time_l:	.byte	1		; time of the previous zero cross detection
 	previous_zc_time_h:	.byte	1
 	previous_zc_time_e:	.byte	1
-	avg_com_len_l:		.byte	1		; averaged commutation length
+	avg_com_len_l:		.byte	1		; average commutation length
 	avg_com_len_h:		.byte	1
 	avg_com_len_e:		.byte	1
-	rpm_l:			.byte	1
-	rpm_h:			.byte	1
+	rps_l:			.byte	1
+	rps_h:			.byte	1
+	avg_rps_l:		.byte	1
+	avg_rps_h:		.byte	1
+	max_power_l:		.byte	1
+	max_power_h:		.byte	1
 	i2c_tmp1:		.byte	1	
 	zc_timeout_l:		.byte	1		; time of comparator scan activation
 	zc_timeout_h:		.byte	1
@@ -232,7 +251,8 @@
 		 rjmp	inv_int
 		.endif
 		rjmp	inv_int				; TIMER2 COMP
-		rjmp	t2_ovf_int			; TIMER2 OVF
+		;rjmp	t2_int_ovf			; TIMER2 OVF
+			rjmp inv_int
 		rjmp	inv_int				; TIMER1 CAPT
 		rjmp	timer_ocr1a_int			; TIMER1 COMPA
 		rjmp	beep_ocr1b_int			; TIMER1 COMPB
@@ -244,7 +264,7 @@
 		nop					; USART, TXC
 		nop					; ADC
 		rjmp	inv_int				; EE_RDY
-		rjmp	run_acomp_int			; ANA_COMP
+		rjmp	aco_int			; ANA_COMP
 		.if	CONTROL_METHOD == 2		; if I2C as signal source
 		 rjmp	i2c_int				; TWI
 		.else
@@ -445,7 +465,7 @@ timer_ocr1a_int:
 		dec	IH
 		sts	ocr1ae, IH
 		brpl	reti_sreg_restore
-		sbr	flags3, 1<<TIMER_READY		; --------------------opt
+		sbr	flags3, 1<<TIMER_READY
 
 
 		; The timer may have been set to switch to the next commutation
@@ -458,21 +478,32 @@ tim_switch_com:	lds	ZL, next_comm_call_addr_l	; load the function pointer to be 
 		wdr
 		cbr	flags3, (1<<TIMER_READY) | (1<<TIMER_COMMUTATE)
 
-		; The commutation has been switched. It's time to await the next ZC.
-		; But before we do that, we must confirm that correct pre-ZC state occured.
-		; Otherwise the comparator will trigger the interrupts too early because of some noises and the motor
-		; will lose sync.
-		; Timer2 will keep scanning the comparator until the pre-ZC state occurs.
-ti_pre_zc_scan:	ldi	JE, 190				; set the timer to trigger interrupt in 65 cycles
-		out	TCNT2, JE
-		ldi	JE, 1<<TOV2			; clear pending interrupt
+ti_pre_zc_scan:	; The commutation has been switched. It's time to await the next ZC. But before we do that, we must
+		; confirm that correct pre-ZC state occured. Otherwise the comparator may trigger some ZC interrupts
+		; too early because of noises and demagnetization from the previous commutation. will lose sync. So
+		; before we set the comparator to call interrupts on ZC edge, we make it detect the pre-ZC edge first.
+		; But first we set timeout for the operation:
+		in	JL, TCNT1L
+		in	JH, TCNT1H
+		lds	JE, zc_timeout_l		; Load calculated timeout for ZC
+		add	JL, JE
+		lds	JE, zc_timeout_h
+		adc	JH, JE
+		out	OCR1AH, JH
+		out	OCR1AL, JL
+		ldi	JE, 1<<OCF1A
 		out	TIFR, JE
-		in	JE, TIMSK
-		sbr	JE, 1<<TOIE2			; enable ovf interrupt
-		out	TIMSK, JE
+		lds	JE, zc_timeout_e
+		sts	ocr1ae, JE
 		led	0, 1
 
-		; Return
+		; Now activate the comparator interrupts, in order to detect the Pre-ZC edge
+		sbi	ACSR, ACIE
+		sbr	flags, 1<<PRE_ZC
+
+		; But maybe it's the Pre-ZC state already? Check.
+		rjmp	aco_pre_zc_ovf_int
+
 reti_sreg_restore:
 		out	SREG, IL
 		reti
@@ -484,69 +515,12 @@ timer_t1ovf_int:led 1, 0
 		lds	JL, tcnt1e
 		inc	JL
 		sts	tcnt1e, JL
-		sbr	flags3, 1<<UPDATE_RPM
+		sbr	flags3, 1<<UPDATE_SPEED
 		dec	sig_timeout
 		breq	t_sig_fail
 		out	SREG, IL
 		reti
 t_sig_fail:	rjmp	signal_err
-
-
-; Timer2 overflow interrupt
-; This timer activates the comparator scan (comparator edge interrupt) after commutation routine.
-; The timer is called with short delays until it detects the proper pre-ZC state on the comparator.
-; This code is a temporary fix for motor sync losses on low RPMs which happened due to errorneous,
-; too early detections. I plan to make it also comparator interrupt driven, instead of timer-sampled.
-t2_ovf_int:	in	IL, SREG
-		clt
-t2_type_check:	sbic	ACSR, ACIS0
-		rjmp	t2_scan_for_low_state
-t2_scan_for_high_state:
-		sbis	ACSR, ACO
-		rjmp	t2_set_again
-		rjmp	t2_set_aco
-t2_scan_for_low_state:
-		sbic	ACSR, ACO
-		rjmp	t2_set_again
-		
-t2_set_aco:	brts	t2_set_aco2			; T set? it's already been the 2nd check, move on
-		set
-		rjmp	t2_type_check			; Check one more time to confirm
-
-		; Pre ZC state detected.
-		; Activate the zero crossing scan.
-		; First, set the timeout for the operation.
-t2_set_aco2:	in	JL, TCNT1L
-		in	JH, TCNT1H
-		lds	JE, zc_timeout_l		; Load calculated timeout for ZC
-		add	JL, JE
-		lds	JE, zc_timeout_h
-		adc	JH, JE
-		out	OCR1AH, JH
-		out	OCR1AL, JL
-		ldi	JE, 1<<OCF1A
-		out	TIFR, JE
-		cbr	flags3, (1<<TIMER_READY) | (1<<TIMER_START_ZC_SCAN)
-		lds	JE, zc_timeout_e
-		sts	ocr1ae, JE
-
-		; Disable timer2 interrupts
-		in	JE, TIMSK
-		cbr	JE, 1<<TOIE2
-		out	TIMSK, JE
-
-		; Activate comparator interrupts. The comparator will trigger an interrupt when the ZC occurs.
-		sbi	ACSR, ACIE
-		out	SREG, IL
-		led	0, 0
-		reti
-
-		; No proper pre-ZC state detected
-		; Set this intrrupt to trigger again in 65 cycles
-t2_set_again:	ldi	JE, 190
-		out	TCNT2, JE
-		out	SREG, IL
-		reti	
 
 
 ; wait X * 8 cycles, args: XH:XL
@@ -568,6 +542,70 @@ d1000c_loop:	dec	XL
 		brpl	delay_1000cycles		; 2
 		ret
 
+
+; 32bit/24bit division
+div32_24:	clr	CH
+d3224_10:	tst	BL
+		breq	d3224_20
+		ldi	CL, 16
+d3224_11:	lsl	XL
+		rol	XH
+		rol	YL
+		rol	YH
+		rol	CH
+		brcs	d3224_12
+		cp	YL, AL
+		cpc	YH, AH
+		cpc	CH, BL
+		brcs	d3224_13
+d3224_12:	sub	YL, AL
+		sbc	YH, AH
+		sbc	CH, BL
+		inc	XL
+d3224_13:	dec	CL
+		brne	d3224_11
+		mov	AL, YL
+		clr	YL
+		mov	AH, YH
+		clr	YH
+		mov	BL, CH
+		ret
+d3224_20:	tst	AH
+		breq	d3224_30
+		ldi	CL, 24
+d3224_21:	lsl	XL
+		rol	XH
+		rol	YL
+		rol	YH
+		rol	CH
+		brcs	d3224_22
+		cp	YH, AL
+		cpc	CH, AH
+		brcs	d3224_23
+d3224_22:	sub	YH, AL
+		sbc	CH, AH
+		inc	XL
+d3224_23:	dec	CL
+		brne	d3224_21
+		mov	AL, YH
+		clr	YH
+		mov	AH, CH
+		ret
+d3224_30:	ldi	CL, 32
+d3224_31:	lsl	XL
+		rol	XH
+		rol	YL
+		rol	YH
+		rol	CH
+		brcs	d3224_32
+		cp	CH, AL
+		brcs	d3224_33
+d3224_32:	sub	CH, AL
+		inc	XL
+d3224_33:	dec	CL
+		brne	d3224_31
+		mov	AL, CH				; store remainder
+		ret
 
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; |                                                 Signal input                                                      |
@@ -762,9 +800,9 @@ i2c_send_stat:	clr	JE				; Send Status
 		rjmp	i2c_send_ack
 
 i2c_send_speed_h:					; Send the high Speed byte
-		lds	JE, rpm_l
+		lds	JE, rps_l
 		sts	i2c_tmp1, JE
-		lds	JE, rpm_h
+		lds	JE, rps_h
 		out	TWDR, JE
 		; go down
 
@@ -793,7 +831,10 @@ signal_power_off:
 ; Parse the power value incoming from RCP/I2C
 ; In case of RCP, limit the pulse length to the power range
 ; Returns power value in XH:XL
+; YH clobbered
 update_power:	;cbr	flags2, 1<<SIGNAL_READY
+		bst	flags, CUT_POWER
+		brts	up_np
 		cli					; cli, we don't want the rcp_int interrupt between these two lines
 		lds	XL, power_signal_l		; read length of the pulse
 		lds	XH, power_signal_h
@@ -809,11 +850,20 @@ update_power:	;cbr	flags2, 1<<SIGNAL_READY
 		ret					; nah, power non-zero, return
 up_fp:		ldi	XL, POWER_RANGE_L		; if full power
 		ldi	XH, POWER_RANGE_H
+		.endif
 		ret
 up_np:		clr	XL				; if no signal or power zero
 		clr	XH
-		.endif
 		ret
+
+; Limit power value (XH:XL) to max_power value. YH, YL clobbered
+limit_power:	lds	YL, max_power_l
+		lds	YH, max_power_h
+		cp	XL, YL
+		cpc	XH, YH
+		brlo	lp_ret
+		movw	XL, YL
+lp_ret:		ret
 
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; |                                                    Power stage                                                    |
@@ -987,11 +1037,7 @@ c0_low:		ldi	ZL, low(sdm_j0)			; set jump address for sdm generator
 		ldi	JL, high(commutation_01)
 		sts	next_comm_call_addr_h, JL
 		cbi	ACSR, ACIE
-		sbi	ACSR, ACIS0			; set comparator to trigger on rising edge
-		;sbi	ACSR, ACI			; clear possibly pending comparator interrupt
-		;sbrc	flags, RUN
-		;sbi	ACSR, ACIE
-		;sbi	ACSR, ACI
+		cbi	ACSR, ACIS0			; set comparator to trigger on falling edge (pre-ZC state)
 		ret
 
 ; R->T, S undriven. RH open, TL pwm
@@ -1013,11 +1059,7 @@ c1_low:		ldi	ZL, low(sdm_j2)
 		sts	next_comm_call_addr_h, JL
 		;led_dbg	1, 0
 		cbi	ACSR, ACIE		
-		cbi	ACSR, ACIS0			; set comparator to trigger on falling edge
-		;sbi	ACSR, ACI
-		;sbrc	flags, RUN
-		;sbi	ACSR, ACIE
-		;sbi	ACSR, ACI
+		sbi	ACSR, ACIS0			; set comparator to trigger on rising edge (pre-ZC state)
 		ret
 
 ; S->T, R undriven. SH open, TL pwm
@@ -1039,10 +1081,7 @@ c2_low:		ldi	ZL, low(sdm_j2)
 		ldi	JL, high(commutation_23)
 		sts	next_comm_call_addr_h, JL
 		cbi	ACSR, ACIE		
-		sbi	ACSR, ACIS0
-		;sbrc	flags, RUN
-		;sbi	ACSR, ACIE
-		;sbi	ACSR, ACI
+		cbi	ACSR, ACIS0
 		ret
 
 ; S->R, T undriven. SH open, RL pwm
@@ -1063,11 +1102,7 @@ c3_low:		ldi	ZL, low(sdm_j4)
 		ldi	JL, high(commutation_34)
 		sts	next_comm_call_addr_h, JL
 		cbi	ACSR, ACIE
-		cbi	ACSR, ACIS0
-		sbi	ACSR, ACI
-		;sbrc	flags, RUN
-		;sbi	ACSR, ACIE
-		;sbi	ACSR, ACI
+		sbi	ACSR, ACIS0
 		ret
 
 ; T->R, S undriven. TH open, RL pwm
@@ -1090,10 +1125,7 @@ c4_low:		ldi	ZL, low(sdm_j4)
 		ldi	JL, high(commutation_45)
 		sts	next_comm_call_addr_h, JL
 		cbi	ACSR, ACIE
-		sbi	ACSR, ACIS0
-		;sbrc	flags, RUN
-		;sbi	ACSR, ACIE
-		;sbi	ACSR, ACI
+		cbi	ACSR, ACIS0
 		ret
 
 ; T->S, R undriven. TH open, SL pwm
@@ -1116,10 +1148,7 @@ c5_low:		ldi	ZL, low(sdm_j0)
 		ldi	JL, high(commutation_50)
 		sts	next_comm_call_addr_h, JL
 		cbi	ACSR, ACIE		
-		cbi	ACSR, ACIS0
-		;sbrc	flags, RUN
-		;sbi	ACSR, ACIE
-		;sbi	ACSR, ACI
+		sbi	ACSR, ACIS0
 		ret
 
 ; call the next commutation. used in startup subroutine. during the run, the timer is responsible for commutation.
@@ -1468,7 +1497,7 @@ swz_to:		lds	XL, startup_forced_com_num
 		brpl	swz_ret				; if not reached yet, keep returning
 		pop	XL				; zc detections failed, go back a function call
 		pop	XL				; remove 16 bit return address from stack
-		rjmp	start_up_again			; go to the start
+		rjmp	start_up			; go to the start
 
 startup_quit:	ldi	XL, START_UP_COUNTER+1		; set number of commutations that must be done sucessfully in start
 		sts	startup_counter, XL
@@ -1481,6 +1510,7 @@ start_handle_signal:
 		sbrc	flags2, SIGNAL_ERROR		; signal error?
 		rcall	handle_signal_error		; yes, handle it
 		rcall	update_power			; read power
+		rcall	limit_power
 		adiw	XL, 0				; if it is 0 or there's an error, go to start
 		brne	shs_ret				; non-zero? just return
 		pop	XL				; was zero, return to main loop
@@ -1489,18 +1519,22 @@ start_handle_signal:
 shs_ret:	ret
 
 ; start up procedure
-start_up:
+start_up:	rcall	commutate
+		rcall	commutate
+
 start_up_again:	lds	XL, startup_attempts
 		inc	XL
 		sts	startup_attempts, XL
-		clr	XL				; reset some vars in case we just quit running mode
-		sts	rpm_l, XL
-		sts	rpm_h, XL
-		in	XL, TIMSK			; disable timer2 interrupt
-		cbr	XL, 1<<TOIE2
-		out	TIMSK, XL
+		clr	XL				; Reset some vars in case we just quit running mode
+		sts	rps_l, XL
+		sts	rps_h, XL
 		cbi     ACSR, ACIS1
+		ldi	XL, STARTUP_MIN_POWER_L
+		ldi	XH, STARTUP_MAX_POWER_H
+		sts	max_power_l, XL			; Limit start-up power
+		sts	max_power_h, XH
 		rcall	start_handle_signal
+		rcall	sdm_on				; Activate sigma-delta generator
 		ldi	XL, byte1(STARTUP_COM_TIMEOUT)
 		ldi	XH, byte2(STARTUP_COM_TIMEOUT)
 		ldi	YL, byte3(STARTUP_COM_TIMEOUT)
@@ -1508,36 +1542,23 @@ start_up_again:	lds	XL, startup_attempts
 		sts	startup_com_time_h, XH
 		sts	startup_com_time_e, YL
 		sbr	flags, (1<<STARTUP)
-		cbr	flags, (1<<RUN)
-		rcall	commutate
-		rcall	commutate
-		rcall	sdm_on				; activate sigma-delta generator
+		cbr	flags, (1<<RUN) | (1<<CUT_POWER)
 start_loop:	rcall	start_handle_signal
 		sts	previous_zc_time_l, BL		; store the time of the previous ZC. these variables need to be
 		sts	previous_zc_time_h, BH		; set properly in case it switched to running mode right after
 		sts	previous_zc_time_e, CL
-		
 		lds	XL, startup_counter
-		set;bst	XL, 0
+		set
 		brts	su_pow
 		clr	XL
 		clr	XH
 		movw	sdm_factor_l, XL
 		rjmp	su_pow_ok
-
-su_pow:		ldi	YH, STARTUP_MAX_POWER_H
-		cpi	XL, STARTUP_MAX_POWER_L		; compare the power value with max allowed start-up power
-		cpc	XH, YH
-		brsh	su_lpu				; higher? limit power (up)
-		ldi	YH, STARTUP_MIN_POWER_H
+su_pow:		ldi	YH, STARTUP_MIN_POWER_H
 		cpi	XL, STARTUP_MIN_POWER_L		; compare the power value with min allowed start-up power
 		cpc	XH, YH
 		brlo	su_lpd				; lower? limit power (down)
 su_ssf:		movw	sdm_factor_l, XL		; set the sdm factor
-		rjmp	su_pow_ok
-su_lpu:		ldi	XL, STARTUP_MAX_POWER_L		; limit power up
-		ldi	XH, STARTUP_MAX_POWER_H
-		movw	sdm_factor_l, XL		; like this, because two sdm_factor bytes must be saved at once
 		rjmp	su_pow_ok
 su_lpd:		ldi	XL, STARTUP_MIN_POWER_L		; limit power down
 		ldi	XH, STARTUP_MIN_POWER_H
@@ -1548,9 +1569,9 @@ su_pow_ok:	wait					; wait until ZC scan is allowed
 		; Even though we are not using comparator interrupts in start-up mode, the awaited comparator edge (zero cross type)
 		; is stored in the ACSR comparator register (has been written there by the previous commutation routine)
 		; In this way we gain one free bit in our "flags", "flags2" registers.
-		sbic	ACSR, ACIS0			; which type of ZC are we waiting for?
+		sbis	ACSR, ACIS0			; which type of ZC are we waiting for?
 		rcall	start_wait_zc_low
-		sbis	ACSR, ACIS0
+		sbic	ACSR, ACIS0
 		rcall	start_wait_zc_high
 
 		lti	BL, BH, CL, CH, 1		; read ZC time
@@ -1604,27 +1625,78 @@ running_mode_switch:
 		sts	zc_timeout_h, XH
 		sts	zc_timeout_e, YL
 
+		.if	SPEED_POWER_LIMIT == 1
+		sts	max_power_l, sdm_factor_l	; Store the current (startup-limited) power as the power limit
+		sts	max_power_h, sdm_factor_h	; until we calculate a new one.
+		.else
+		ldi	XL, POWER_RANGE_L
+		ldi	XH, POWER_RANGE_H
+		sts	max_power_l, XL
+		sts	max_power_h, XH
+		.endif
+
 		clr	XL				; Clear some other stuff
 		sts	timing_angle, XL
 		cbr	flags, 1<<STARTUP
 		sbr	flags, 1<<RUN
 		rcall	update_power
-	
+		rcall	limit_power
 		
 		 ; Config the comparator
                 sbi        ACSR, ACIS1                  ; This one always must be set (triggers on logic change)
 
 		; Activate th first interrupt driven pre-ZC and ZC scan
 		cli					; Calling interrupt subroutine here
-		in	IL, SREG			; Need to set it because it's restored from IL there
+		in	IL, SREG			; Need to set it because it's restored from IL inside
 		rcall	ti_pre_zc_scan
-		rjmp	run_wait_zc_timeout		; Everything is set now. Await ZC timeout.*/
+		
+		wait					; wait until the timer is "ready".
+		; If it comes to this place, it means that no proper ZC occured in time.
+		cbi	ACSR, ACIE			; Disable comparator interrupts
+		rjmp	start_up_again			; Go to start-up procedure
 
+
+; Pre-ZC comparator interrupts
+; This code handles the Pre-ZC edge detection, and checks if the correct Pre-ZC state has been detected.
+; If it has, it configures comparator to trigger an interrupt on actual ZC edge.
+aco_pre_zc_ovf_int:
+		; We will use the T flag as some temporary variable. It's not used in any instruction below.
+		clt										
+aco_pre_zc_type_check:
+		sbis	ACSR, ACIS0
+		rjmp	aco_pre_zc_scan_for_low_state
+aco_pre_zc_scan_for_high_state:
+		sbis	ACSR, ACO
+		rjmp	aco_pre_zc_ret
+		rjmp	aco_pre_zc_set_aco
+aco_pre_zc_scan_for_low_state:
+		sbic	ACSR, ACO
+		rjmp	aco_pre_zc_ret
+aco_pre_zc_set_aco:					; The state on the comparator looks like correct.
+		brts	aco_pre_zc_set_aco2		; H set? it's already been the 2nd check, move on
+		set
+		rjmp	aco_pre_zc_type_check		; Check one more time to make sure
+
+		; Pre ZC state detected.
+aco_pre_zc_set_aco2:	
+		cbr	flags, 1<<PRE_ZC
+		in	JE, ACSR			; Pre ZC detected, we will wait for the opposite edge now.
+		ldi	JL, 1<<ACIS0
+		eor	JE, JL				; Re-config the comparator, invert the edge bit.
+		out	ACSR, JE
+		led	0, 0
+aco_pre_zc_ret:	out	SREG, IL
+		reti
+
+; Analog comparator interrupt
+aco_int:	in	JE, SREG
+		mov	IL, JE
+		sbrc	flags, PRE_ZC
+		rjmp	aco_pre_zc_ovf_int
 
 ; ---- Step 1. Zero Crossing detection ---
-; The single motor cycle begins in this place. The analog comparator which we have set after some commutation routine,
-; is telling us that a Zero Crossing occured, by calling an interrupt here.
-run_acomp_int:	in	JE, SREG
+; The single motor cycle begins in this place. The analog comparator which we have set earlier
+; is telling us that the Zero Crossing occured, by calling an interrupt here.
 		clt					; Clear the T flag, we will use it below
 run_aco_check:	sbis	ACSR, ACIS0			; Check what kind of edge we were waiting for
 		rjmp	run_aco_1_0
@@ -1633,7 +1705,6 @@ run_aco_check:	sbis	ACSR, ACIS0			; Check what kind of edge we were waiting for
 run_aco_0_1:	sbis	ACSR, ACO
 		rjmp	run_aco_reti
 		rjmp	run_aco_zc
-
 run_aco_1_0:	sbis	ACSR, ACO
 		rjmp	run_aco_zc
 run_aco_reti:	out	SREG, JE
@@ -1651,13 +1722,12 @@ run_aco_zc:	brts	run_aco_zc2			; T flag set means that it was the second check, 
 		; However, it may have interrupted some calculations, like speed, governor, power control on so on.
 		; In that case we will have to save the context, to restore it later. Somewhat like in multithreading.
 run_aco_zc2:	bst	flags2, CALC_IN_PROGRESS	; Interrupted some calculations?
-		brts	run_save_context		; It did
+		brts	run_save_ctx			; It did
 		pop	JH				; Nah, it didn't
 		pop	JH				; Just get rid of the PC that the interrupt threw onto stack
 		rjmp	run_process_zc
 
-run_save_context:					; Save all registers used in these calculations
-		led	1, 1
+run_save_ctx:	led	1, 1				; Save all registers used in these calculations
 		sts	st_sreg, JE			; SREG	
 		sts	st_xl, XL			; X
 		sts	st_xh, XH
@@ -1665,11 +1735,11 @@ run_save_context:					; Save all registers used in these calculations
 		sts	st_yh, YH
 		sts	st_cl, CL			; C
 		sts	st_ch, CH
-		sts	st_al, AL			; D
+		sts	st_al, AL			; A
 		sts	st_ah, AH
 		sts	st_bl, BL			; B
-		;sts	st_bh, BH
-		; The interrupt has put two bytes of interrupted Program Counter on the stack when it was called.
+		sts	st_bh, BH
+		; The interrupt put two bytes of interrupted Program Counter on the stack when it was called.
 		; But we won't remove them on purpose, so later we can dig it out of the stack, when it's time
 		; to restore the context.
 		
@@ -1681,24 +1751,22 @@ run_process_zc: cbi	ACSR, ACIE			; Disable comparator interrupts
 		sei					; Interrupts on
 
 
-		; ---- Step 2. Zero Crossing time filtering ----
-		; It's beneficial to filter the ZC times to make the motor work more quiet and efficient.
-		; To do that we take arithmetic mean of detected ZC time and predicted ZC time.
-		; The predicted ZC time is filtered ZC time from the previous commutation + last commutation length.
+; ---- Step 2. Zero Crossing time filtering ----
+; It's beneficial to filter the ZC times to make the motor work more quiet and efficient.
+; To do that we take arithmetic mean of detected ZC time and predicted ZC time.
+; The predicted ZC time is filtered ZC time from the previous commutation + last commutation length.
 		lds	CH, previous_zc_time_l		; Load previous ZC time (DH:DL:CH)
 		lds	DL, previous_zc_time_h
 		lds	DH, previous_zc_time_e
 		lds	XL, com_length_l		; load previous commutation length (YL:XH:XL)
 		lds	XH, com_length_h
 		lds	YL, com_length_e
-			
 		sub	BL, CH				; get time delta between current and previous ZC (CL:BH:BL)
 		sbc	BH, DL
 		sbc	CL, DH
 		add	XL, BL				; so we've got previously saved commutation length, and time delta
 		adc	XH, BH				;  between this and previous ZC. make arithmetic mean of it
 		adc	YL, CL				;  (YL:XH:XL)
-
 		sts	zc_timeout_l, XL
 		sts	zc_timeout_h, XH
 		sts	zc_timeout_e, YL
@@ -1717,15 +1785,16 @@ run_process_zc: cbi	ACSR, ACIE			; Disable comparator interrupts
 		sts	previous_zc_time_h, XH
 		sts	previous_zc_time_e, YL
 
-		; --- Step 3. Timing ---
-		; There is a thing called timing delay. Usually we don't switch commutation just when ZC is detected, but wait
-		; some angle. In the natural case it is 30°, the middle point between two ZCs, but we accept other values of
-		; timing here. Just to make it clear: Timing advance means how much the commutation switch is preceding the
-		; natural 30° point. And timing delay is the angle between ZC and commutation change.
-		; TIMING_ADVANCE = 30° - timing_delay.
-		; Here we calculate the timing delay to the next commutation. The timing angle (0°-30°), is given here
-		; as a value 0-128. We do a multiplication of commutation time with that value, and then divide by 256
-		; which gives us 0 - 0.5 of commutation time as a result, which is 0°-30° of motor cycle.
+
+; --- Step 3. Timing ---
+; There is a thing called timing delay. Usually we don't switch commutation just when ZC is detected, but wait
+; some angle. In the natural case it is 30°, the middle point between two ZCs, but we accept other values of
+; timing here. Just to make it clear: Timing advance means how much the commutation switch is preceding the
+; natural 30° point. And timing delay is the angle between ZC and commutation change.
+; TIMING_ADVANCE = 30° - timing_delay.
+; Here we calculate the timing delay to the next commutation. The timing angle (0°-30°), is given here
+; as a value 0-128. We do a multiplication of commutation time with that value, and then divide by 256
+; which gives us 0 - 0.5 of commutation time as a result, which is 0°-30° of motor cycle.
 		mov	CH, AL				; ------- optimize
 		mov	DL, AH
 		mov	DH, BL
@@ -1749,14 +1818,17 @@ run_process_zc: cbi	ACSR, ACIE			; Disable comparator interrupts
 		sbr	flags3, 1<<TIMER_COMMUTATE	; make the timer call the next commutation function
 		rcall	timer_set			; launch the timer
 
-		; --- Step 4. Other calculations ---
-		; The timer is on now, it will commutate when the time comes. We don't have to worry about it anymore.
-		; In the free time, we will calculate some stuff here, like T->RPM coversion, governor mode etc.
-		; Note that some calculations will be done no matter how quick the timer commutates and starts the comparator scan.
-		; There is an additional delay between commutation and comparator activation.
+
+; --- Step 4. Other calculations ---
+; The timer is on now, it will commutate when the time comes. We don't have to worry about it anymore.
+; In the free time, we will calculate some stuff here, like T->RPM coversion, governor mode etc.
+; Note that some calculations will be done no matter how quick the timer commutates and starts the comparator scan.
+; There is an additional delay between commutation and comparator activation.
 		
+		; --- Context restoration ---
 		bst	flags2, CALC_IN_PROGRESS
 		brtc	run_no_con_res
+		cli
 		lds	XL, st_sreg
 		out	sreg, XL
 		lds	XL, st_xl
@@ -1768,41 +1840,41 @@ run_process_zc: cbi	ACSR, ACIE			; Disable comparator interrupts
 		lds	AL, st_al
 		lds	AH, st_ah
 		lds	BL, st_bl
+		lds	BH, st_bh
 		led	1, 0
-		ret					; jump to the PC remaining on the stack (see "run_save_context")
-
+		reti					; jump to the PC remaining on the stack (see "run_save_ctx")
 run_no_con_res:	sbr	flags2, 1<<CALC_IN_PROGRESS	; mark that we started calculations
 
+		
+		; --- Timing angle progression ---
 		cpi	CL, COM_DELAY			; increase timing angle smoothly
 		brsh	run_tim_ang_ok			; after switchng from start-up (no delay) to running mode.
 		inc	CL				; we do that to prevent losing motor sync on that switch.
 		sts	timing_angle, CL
 run_tim_ang_ok:	
 		
-		; Read the power from I2C/RCP
+		
+		; --- Throttle control - normal mode ---
+	.if	GOVERNOR_MODE == 0
 		sbrc	flags2, SIGNAL_ERROR		; signal error?
 		rcall	handle_signal_error		; yes, handle it
-		rcall	update_power			; read power
-
-		.if	GOVERNOR_MODE == 1	
-
-		.else
-
-		; Normal mode
-		lds	DL, com_length_l		;  yes, load commutation length
-		lds	DH, com_length_h
+		rcall	update_power			; Read the power from I2C/RCP
+		rcall	limit_power
+		lds	CL, com_length_l		; Load commutation length
+		lds	CH, com_length_h
 		lds	YL, com_length_e
-		subi	DL, byte1(COM_T_RPM_MAX)
-		sbci	DH, byte2(COM_T_RPM_MAX)
+		subi	CL, byte1(COM_T_RPM_MAX)
+		sbci	CH, byte2(COM_T_RPM_MAX)
 		sbci	YL, byte3(COM_T_RPM_MAX)
-		brcc	run_power_ok			; no carry? rpm not too fast, just jump and set sdm factor
+		brcc	run_set_throt			; no carry? rpm not too fast, just jump and set sdm factor
 		lsr	XH				; too fast? divide power by 2
 		ror	XL
-		.endif
+run_set_throt:	movw	sdm_factor_l, XL		; Set throttle
+	.endif	
+		
 
-run_power_ok:	movw	sdm_factor_l, XL		; Set the outgoing power
-				
-		lds	XL, avg_com_len_l
+		; Calculate filtered commutation length, will be used for speed calculation
+		lds	XL, avg_com_len_l		
 		lds	XH, avg_com_len_h
 		lds	YL, avg_com_len_e
 		movw	AL, XL
@@ -1813,9 +1885,11 @@ run_power_ok:	movw	sdm_factor_l, XL		; Set the outgoing power
 		add	AL, XL
 		adc	AH, XH
 		adc	BL, YL
+		cli
 		lds	XL, com_length_l
 		lds	XH, com_length_h
 		lds	YL, com_length_e
+		sei
 		add	AL, XL
 		adc	AH, XH
 		adc	BL, YL
@@ -1829,100 +1903,184 @@ run_power_ok:	movw	sdm_factor_l, XL		; Set the outgoing power
 		sts	avg_com_len_h, AH
 		sts	avg_com_len_e, BL
 
-		; Cycle time -> RPM conversion. Since f = 1/T, we have to make a division here.
-		; Unfortunately the AVR processor doesn't have it. This is a 32 by 24 bit division, speed-optimized.
+run_calc_loop_begin:					; Start of the calculations loop
+
+		; ---Cycle time -> RPM conversion ---
+		; Since f = 1/T, we have to make a division here. This is a 32 by 24 bit division, speed-optimized.
 		; Shouldn't take more than 300 cycles. We don't have to hurry that much anyway, we can always stop the
 		; calculation, handle the necessary stuff, and get back to it.
 		; Inspired by this code: http://www.mikrocontroller.net/articles/AVR_Arithmetik#32_Bit_.2F_32_Bit
+		sbrs	flags3, UPDATE_SPEED		; If the time to update speed comes
+		rjmp	run_calc_loop_end		; nah, not yet
 
-		bst	flags3, UPDATE_RPM
-		;brtc	run_rpm_done
+		sbr	flags2, 1<<CALC_IN_PROGRESS	; yes, set the flag for calculations in progress
+		cbr	flags3, 1<<UPDATE_SPEED
 		ldi	XL, byte1(TICKS_PER_SEC/6)
 		ldi	XH, byte2(TICKS_PER_SEC/6)
 		ldi	YL, byte3(TICKS_PER_SEC/6)
 		ldi	YH, 0
-		cbr	flags3, 1<<UPDATE_RPM
-
-		clr	CH
-run_udi10:	tst	BL
-		breq	run_udi20
-		ldi	CL, 16
-run_udi11:	lsl	XL
-		rol	XH
-		rol	YL
-		rol	YH
-		rol	CH
-		brcs	run_udi12
-		cp	YL, AL
-		cpc	YH, AH
-		cpc	CH, BL
-		brcs	run_udi13
-run_udi12:	sub	YL, AL
-		sbc	YH, AH
-		sbc	CH, BL
-		inc	XL
-run_udi13:	dec	CL
-		brne	run_udi11
-		mov	AL, YL
-		clr	YL
-		mov	AH, YH
-		clr	YH
-		mov	BL, CH
-		rjmp	run_div_done
- 
-run_udi20:	tst	AH
-		breq	run_udi30
-		ldi	CL, 24
-run_udi21:	lsl	XL
-		rol	XH
-		rol	YL
-		rol	YH
-		rol	CH
-		brcs	run_udi22
-		cp	YH, AL
-		cpc	CH, AH
-		brcs	run_udi23
-run_udi22:	sub	YH, AL
-		sbc	CH, AH
-		inc	XL
-run_udi23:	dec	CL
-		brne	run_udi21
-		mov	AL, YH
-		clr	YH
-		mov	AH, CH
-		rjmp	run_div_done
- 
-run_udi30:	ldi	CL, 32
-run_udi31:	lsl	XL
-		rol	XH
-		rol	YL
-		rol	YH
-		rol	CH
-		brcs	run_udi32
-		cp	CH, AL
-		brcs	run_udi33
-run_udi32:	sub	CH, AL
-		inc	XL
-run_udi33:	dec	CL
-		brne	run_udi31
-		mov	AL, CH				;store remainder
-
-run_div_done:	
+		cbr	flags3, 1<<UPDATE_SPEED
+		rcall	div32_24			; divide
 		cli
-		sts	rpm_l, XL
-		sts	rpm_h, XH
+		sts	rps_l, XL
+		sts	rps_h, XH
 		sei
-		
-run_wait_zc_timeout:
-		cbr	flags2, 1<<CALC_IN_PROGRESS	; calculations done
 
-		wait					; wait until the timer is "ready".
+		; Throttle limit based on motor speed. We are trying to limit possible overcurrent this way.
+		; 16bit x 16bit. XH:XL * YH:YL = CH:CL:BH:BL
+	.if	SPEED_POWER_LIMIT == 1
+		ldi	YL, ST_CONST_L
+		ldi	YH, ST_CONST_H
+		clr	CL
+		clr	CH
+		mul	XL, YL
+		movw	BL, AL				; byte1 (BL) done
+		mul	XH, YL
+		add	BH, AL				; byte2 (BH) done
+		adc	CL, AH
+		mul	YH, XL
+		add	BH, AL
+		adc	CL, AH	
+		adc	CH, CH
+		mul	YH, XH
+		add	CL, AL				; byte3 (CL) done
+		adc	CH, AH				; byte4 (CH) done
+
+		; Got the result. We will skip the youngest byte now, which is equivalent to division by 256.
+		ldi	YL, POWER_RANGE_L
+		ldi	YH, POWER_RANGE_H
+		clr	BL
+		cp	BH, YL
+		cpc	CL, YH
+		cpc	CH, BL
+		brlo	run_thl_set_max_power
+		mov	BH, YL
+		mov	CL, YH
+run_thl_set_max_power:
+		sts	max_power_l, BH
+		sts	max_power_h, CL
+	.endif
+
+	.if	GOVERNOR_MODE != 0	
+		; --- Governor mode ---
+		; In governor mode, the ESC uses automatic throttle control in order to achieve specified RPM.
+		; We will be using a PID loop here.
+		;
+		;  P(t)       E(t)   -------------         -------        S(t)
+		;   --->--(X)---->--|  P control  |---->--| Motor |----.----->
+		;      +   | -       -------------         -------     |
+		;          |             -----------------             |
+		;          *-----<-----< Power <-- Speed  |----<-------*
+		;            F(t)        -----------------
+		;
+		; P - Power signal (RCP/I2C etc)
+		; S - Motor speed in Rounds Per Second read from the motor
+		; F - Feedback - power signal value corresponding to S
+		; E - Error value
+		; Let's start with handling the power signal
+		sbrc	flags2, SIGNAL_ERROR		; Signal error?
+		rcall	handle_signal_error		; Yes, handle it
+		lds	YL, rps_l			; Y := S
+		lds	YH, rps_h
+		ldi	XL, POWER_RANGE_L		; X := Pmax
+		ldi	XH, POWER_RANGE_H
+
+		; So we've got motor speed and value of max power signal (POWER_RANGE). First we need to convert the
+		; speed value into corresponding power signal value: S(t) -> F(t).
+		; Because speed desired on the motor is:
+		;  Sd(t) = P(t)/Pmax * Smax
+		; power signal value (F) corresponding to motor speed can be calulcated like this:
+		;  F(t) = S(t) * Pmax / Smax
+		; So let's do the S*Pmax first. 16bit x 16bit. XH:XL * YH:YL = CH:CL:BH:BL
+		clr	CL
+		clr	CH
+		mul	XL, YL
+		movw	BL, AL				; byte1 (BL) done
+		mul	XH, YL
+		add	BH, AL				; byte2 (BH) done
+		adc	CL, AH
+		mul	YH, XL
+		add	BH, AL
+		adc	CL, AH	
+		adc	CH, CH
+		mul	YH, XH
+		add	CL, AL				; byte3 (CL) done
+		adc	CH, AH				; byte4 (CH) done
+
+		; Need to make a division by Smax. But since it's a division by constant
+		; we can do a trick. We can multiply the numerator by something, and then divide it al by 2^24
+		; by skipping 3 bytes of the result.
+		; 1/S = x/2^24 => x = 2^24/S
+		; ---- normal divisionfor now --- optimize
+		ldi	XL, low(GOV_MAX_RPS)		; X := Smax
+		ldi	XH, high(GOV_MAX_RPS)
+		movw	AL, XL
+		movw	XL, BL
+		movw	YL, CL
+		clr	BL
+		rcall	div32_24
+		movw	BL, XL		
+		rcall	update_power			; Read power signal
+		adiw	XL, 0
+		breq	run_gov_np
+		ldi	YH, high(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
+		cpi	XL, low(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
+		cpc	XH, YH
+		brsh	PC+3				; 
+		ldi	XL, low(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
+		mov	XH, YH
+		sub	XL, BL				; Caluclate E(t)
+		sbc	XH, BH
+		brpl	run_gov_e_done
+run_gov_np:	clr	XL
+		clr	XH
+
+		; --- P segment ---
+run_gov_e_done:	ldi	YL, GOV_P
+		ldi	YH, 0
+		clr	CL
+		clr	CH
+		mul	XL, YL
+		movw	BL, AL				; byte1 (BL) done
+		mul	XH, YL
+		add	BH, AL				; byte2 (BH) done
+		adc	CL, AH
+		mul	YH, XL
+		add	BH, AL
+		adc	CL, AH	
+		adc	CH, CH
+		mul	YH, XH
+		add	CL, AL				; byte3 (CL) done
+		adc	CH, AH				; byte4 (CH) done
+
+		movw	XL, BL
+		movw	YL, CL
+		adiw	YL, 0
+		breq	run_gov_p_done
+		ldi	XL, POWER_RANGE_L
+		ldi	XH, POWER_RANGE_H
+run_gov_p_done:	add	XL, sdm_factor_l
+		adc	XH, sdm_factor_h
+		ror	XH
+		ror	XL
+		rcall	limit_power
+		movw	sdm_factor_l, XL		; Set throttle
+	.endif
 		
+run_calc_loop_end:					; End of the calculations loop
+		cbr	flags2, 1<<CALC_IN_PROGRESS	; calculations done
+		sbrc	flags2, SIGNAL_ERROR		; Signal error?
+		rcall	handle_signal_error		; Yes, handle it
+		sbrs	flags3, TIMER_READY		; The timeout for ZC has come?
+		rjmp	run_calc_loop_begin		; No, loop again
+
 		; If it comes to this place, it means that no proper ZC occured in time.
 		cbi	ACSR, ACIE			; Disable comparator interrupts
-		rjmp	start_up			; Go to start-up procedure
+		rjmp	start_up_again			; Go to start-up procedure
 
-fet_test:	;sbi	RL_PORT, RL_PIN
+; *-------------------------------------------------------------------------------------------------------------------*
+
+/*fet_test:	;sbi	RL_PORT, RL_PIN
 		;sbi	SL_PORT, SL_PIN
 		;sbi	TL_PORT, TL_PIN
 		;sbi	RH_PORT, RH_PIN
@@ -1938,22 +2096,65 @@ fet_test:	;sbi	RL_PORT, RL_PIN
 		ldi	XH, high(CLOCK_MHZ*1000000/7000/1000)
 		rcall	delay_1000cycles
 fet_test2:	
-		cbi	RL_PORT, RL_PIN
-		;cbi	SL_PORT, SL_PIN
-		;cbi	TL_PORT, TL_PIN
-		sbi	RH_PORT, RH_PIN
-		;sbi	SH_PORT, SH_PIN
-		;sbi	TH_PORT, TH_PIN
-		ldi	XL, low(CLOCK_MHZ*1000000/1000/1000)	; wait 50 ms
-		ldi	XH, high(CLOCK_MHZ*1000000/1000/1000)
-		rcall	delay_1000cycles
-		rjmp	fet_test
+		sbi	TH_PORT, TH_PIN
+		nop
+		rjmp	fet_test2
 
+fet_test3:	sbi	RL_PORT, RL_PIN
+		sbi	SL_PORT, SL_PIN
+		sbi	TL_PORT, TL_PIN
+		led	0, 1
+		ldi	XL, low(8000)
+		ldi	XH, high(8000)
+		rcall	delay_1000cycles
+		led	0, 0
+		led	1, 1
+		cbi	RL_PORT, RL_PIN
+		cbi	SL_PORT, SL_PIN
+		cbi	TL_PORT, TL_PIN
+		ldi	XL, low(8000)
+		ldi	XH, high(8000)
+		rcall	delay_1000cycles
+		led	1, 0
+		rjmp	fet_test3
+
+testt:
+	.equ MA = 256*16
+	.equ MB = 255*256
+		ldi	YL, low(MB)
+		ldi	YH, high(MB)
+		ldi	XL, low(MA)
+		ldi	XH, high(MA)
+
+		mul	XL, YL
+		movw	BL, AL				; byte1 (BL) done
+		mul	XH, YL
+		add	BH, AL				; byte2 (BH) done
+		adc	CL, AH
+
+		mul	YH, XL
+		add	BH, AL
+		adc	CL, AH
+		adc	CH, CH
+		mul	YH, XH
+		add	CL, AL
+		adc	CH, AH
+
+		ldi	YL, low(MA*MB)
+		ldi	YH, high(MA*MB)
+		ldi	ZL, byte3(MA*MB)
+		ldi	ZH, byte4(MA*MB)
+		movw	AL, BL
+		movw	BL, CL
+		clr	CL
+		clr	CH
+		movw	XL, CL
+		nop*/
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; |                                                       Main                                                        |
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; The program execution stars here
-reset:
+reset:		;rjmp	tstt
 		in	IL, MCUCSR			; read reset reason
 		sbi	RL_DDR, RL_PIN			; set fet controlling pins as out
 		sbi	RH_DDR, RH_PIN
@@ -1993,7 +2194,7 @@ reset:
 		  cbi	LED4_PORT, LED4_PIN
 		 .endif
 		.endif
-
+	//rjmp	fet_test2
 		led	0, 1
 		led	1, 1
 		ldi	XL, low(CLOCK_MHZ*1000000/20/1000)	; wait 50 ms
@@ -2014,7 +2215,7 @@ reset_clr_lp:	st	X+, YL				; clear ram variables
 
 
 		; enable timer interrupts
-		ldi	XL, (1<<TOIE1) | (1<<OCIE1A) | (1<<TOIE2)
+		ldi	XL, (1<<TOIE1) | (1<<OCIE1A)
 		out	TIMSK, XL
 
 		; timer2 prescaler 0
@@ -2080,8 +2281,8 @@ reset_chk_po:	sbrc	IL, PORF
 
 reset_ok:	;rcall	beep_po				; normal power on start occured
 
-reset_chk_done:
-		led	1, 0
+reset_chk_done:	led	1, 0
+
 		rjmp	ml_res_sig_cnt
 ; Main loop
 main_loop:	
