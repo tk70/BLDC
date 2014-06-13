@@ -14,7 +14,6 @@
 ; - proper active rectification (unfinished yet)
 ; - governor mode (unfinished yet)
 ; - reverse
-; - speed-current limit
 ; - hardware checks
 ; - beeps (unfinished yet)
 
@@ -23,9 +22,9 @@
 .include "bldc.inc"
 
 .equ TIMER_PRESCALER = 1
-.equ TICKS_PER_US = CLOCK_MHZ/TIMER_PRESCALER
-.equ TICKS_PER_MS = TICKS_PER_US * 1000
-.equ TICKS_PER_SEC = TICKS_PER_MS * 1000
+.equ TICKS_PER_US = CLOCK_HZ / TIMER_PRESCALER / 1000000
+.equ TICKS_PER_MS = CLOCK_HZ / TIMER_PRESCALER / 1000
+.equ TICKS_PER_SEC = CLOCK_HZ / TIMER_PRESCALER
 
 .equ COM_T_RPM_MIN = 1000000*10*TICKS_PER_US/MIN_RPM
 .equ COM_T_RPM_MAX = 1000000*10*TICKS_PER_US/MAX_RPM
@@ -33,6 +32,10 @@
 .equ MAX_RPS = MAX_RPM / 60
 .equ GOV_MAX_RPS = GOVERNOR_MAX_RPM / 60
 .equ GOV_MIN_RPS = GOVERNOR_MIN_RPM / 60
+
+.equ SDM_FREQUENCY = 100000
+
+
 
 .if CONTROL_METHOD == 1
 	; If we chose RC pulse as control method
@@ -90,8 +93,16 @@
 .equ STARTUP_SPEED_STEP = STARTUP_RPM_STEP * STARTUP_COM_TIMEOUT / 100;
 .equ STARTUP_COM_T_MIN = 1000000*10*TICKS_PER_US/STARTUP_MAX_RPM
 
-
 .equ COM_DELAY = 128 - TIMING_ADVANCE
+
+.equ SDM_CYCLE_TIME = CLOCK_HZ / SDM_FREQUENCY
+.if SDM_CYCLE_TIME > 255
+	.error	"Selected SDM frequency is too low"
+	.exit
+.elif SDM_CYCLE_TIME < 50
+	.error	"Selected SDM frequency is too high"
+	.exit
+.endif
 
 ; Beeper on state in one cycle time [us]
 .equ BEEP_ON_TIME = 20
@@ -250,14 +261,13 @@
 		 nop
 		 rjmp	inv_int
 		.endif
-		rjmp	inv_int				; TIMER2 COMP
-		;rjmp	t2_int_ovf			; TIMER2 OVF
-			rjmp inv_int
+		rjmp	sdm_sample_int			; TIMER2 COMP
+		rjmp	inv_int				; TIMER2 OVF
 		rjmp	inv_int				; TIMER1 CAPT
 		rjmp	timer_ocr1a_int			; TIMER1 COMPA
 		rjmp	beep_ocr1b_int			; TIMER1 COMPB
 		rjmp	timer_t1ovf_int			; TIMER1 OVF
-		rjmp	sdm_sample_int			; TIMER0 OVF
+		nop					; TIMER0 OVF
 		nop					; SPI, STC Serial Transfer Complete
 		nop					; USART, RXC
 		nop					; USART, UDRE
@@ -676,7 +686,27 @@ rcp_rcp_high_state:					; rising edge detected. start measuring how long it is
 .elif CONTROL_METHOD == 2
 ; --- I2C ---
 .macro		i2c_init
+	.if	I2C_ADDR_PINS
+		cbi	I2C_ADDR0_DDR, I2C_ADDR0_P	; Set as input (yeah, it should be as input already)
+		cbi	I2C_ADDR1_DDR, I2C_ADDR1_P
+		.if	I2C_ADDR_PULL_UPS		; Turn on pull up resistors if needed
+		sbi	I2C_ADDR0_PORT, I2C_ADDR0_P	
+		sbi	I2C_ADDR1_PORT, I2C_ADDR1_P
+		.endif
+		nop					; Wait a moment until the voltage from pull-up appears on pin
+		ldi	XL, I2C_SLAVE_ADDRESS<<1	
+		in	XH, I2C_ADDR0_PIN
+		com	XH
+		bst	XH, I2C_ADDR0_P
+		bld	YL, 0
+		in	XH, I2C_ADDR1_PIN
+		com	XH
+		bst	XH, I2C_ADDR1_P
+		bld	YL, 1
+		add	XL, YL
+	.else
 		ldi	XL, I2C_SLAVE_ADDRESS<<1
+	.endif
 		out	TWAR, XL
 		ldi	XL, (1<<TWIE) | (1<<TWEA) | (1<<TWINT) | (1<<TWEN)
 		out	TWCR, XL
@@ -857,12 +887,19 @@ up_np:		clr	XL				; if no signal or power zero
 		ret
 
 ; Limit power value (XH:XL) to max_power value. YH, YL clobbered
-limit_power:	lds	YL, max_power_l
+limit_power:	cp	XL, sdm_factor_l
+		cpc	XH, sdm_factor_h
+		brlo	lp_upper_bound
+		breq	lp_upper_bound
+		movw	XL, sdm_factor_l
+		subi	XL, low(-POWER_RANGE/20)
+		sbci	XH, high(-POWER_RANGE/20)
+lp_upper_bound:	lds	YL, max_power_l
 		lds	YH, max_power_h
 		cp	XL, YL
 		cpc	XH, YH
 		brlo	lp_ret
-		movw	XL, YL
+lp_set:		movw	XL, YL
 lp_ret:		ret
 
 ; *-------------------------------------------------------------------------------------------------------------------*
@@ -991,8 +1028,8 @@ handle_signal_error:
 		sbrc	flags, SDM_ACTIVE
 		rcall	sdm_off
 		xfets_off
-		ldi	XL, low(CLOCK_MHZ*1000000/1000/1000)	; 1 ms
-		ldi	XH, high(CLOCK_MHZ*1000000/1000/1000)
+		ldi	XL, low(CLOCK_HZ/1000/1000)	; 1 ms
+		ldi	XH, high(CLOCK_HZ/1000/1000)
 		rcall	delay_1000cycles
 		yfets_off
 		;sbrs	flags, BRAKED
@@ -1191,8 +1228,8 @@ bp_ct:		sbrs	flags3, TIMER_READY		; check timer. if it's ready, break the loop
 		cbr	XL, 1<<OCIE1B
 		out	TIMSK, XL
 		cbr	flags2, 1<<BEEPER		; give it some time for demagnetization not to destroy the fet with inductive kickback
-		ldi	XL, low(CLOCK_MHZ*1000000/1000/333)	; 3 ms
-		ldi	XH, high(CLOCK_MHZ*1000000/1000/333)
+		ldi	XL, low(CLOCK_HZ/1000/333)	; 3 ms
+		ldi	XH, high(CLOCK_HZ/1000/333)
 		rcall	delay_1000cycles
 		wdr
 		RX_off
@@ -1296,10 +1333,15 @@ beep_single:	led	0, 1
 ; No power jump between 99 and 100% throttle.
 ; http://en.wikipedia.org/wiki/Pulse-density_modulation
 
+sdm_init:	ldi	XL, SDM_CYCLE_TIME
+		out	OCR2, XL
+		ldi	XL, (1<<CS20) | (1<<WGM21)	; timer2: prescaler 0, OCR2 as top value
+		out	TCCR2, XL
+		ret
 
 ; Activate the SDM generator
 sdm_on:		in	XH, TIMSK
-		sbr	XH, 1<<TOIE0
+		sbr	XH, 1<<OCIE2
 		sbr	flags, 1<<SDM_ACTIVE
 		cbr	flags, (1<<BRAKED) | (1<<SDM_STATE)
 		clr	sdm_err_l
@@ -1309,10 +1351,10 @@ sdm_on:		in	XH, TIMSK
 
 ; Disable SDM
 sdm_off:	in	XH, TIMSK
-		cbr	XH, 1<<TOIE0
+		cbr	XH, 1<<OCIE2
 		cbr	flags, 1<<SDM_ACTIVE
 		out	TIMSK, XH
-		ldi	XL, 1<<TOV0
+		ldi	XL, 1<<OCF2
 		out	TIFR, XH			; make 100% sure that no delayed interrupt will occur
 		;led_dbg	5, 0
 		ret
@@ -2028,12 +2070,26 @@ run_thl_set_max_power:
 		cpc	XH, YH
 		brsh	PC+3				; 
 		ldi	XL, low(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
-		mov	XH, YH
+		ldi	XH, high(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
 		sub	XL, BL				; Caluclate E(t)
 		sbc	XH, BH
-		brpl	run_gov_e_done
+		brpl	PC+4
 run_gov_np:	clr	XL
 		clr	XH
+		rjmp	run_gov_e_done
+
+/*		; Apply a 1% dead zone on the error value
+		ldi	YH, high(POWER_RANGE/100)
+		cpi	XL, low(POWER_RANGE/100)
+		cpc	XH, YH
+		brsh	PC+4
+		clr	XL
+		clr	XH
+		rjmp	run_gov_e_done
+
+		subi	XL, low(POWER_RANGE/100)
+		sbci	XH, high(POWER_RANGE/100)*/
+		
 
 		; --- P segment ---
 run_gov_e_done:	ldi	YL, GOV_P
@@ -2057,14 +2113,10 @@ run_gov_e_done:	ldi	YL, GOV_P
 		movw	YL, CL
 		adiw	YL, 0
 		breq	run_gov_p_done
-		ldi	XL, POWER_RANGE_L
-		ldi	XH, POWER_RANGE_H
-run_gov_p_done:	add	XL, sdm_factor_l
-		adc	XH, sdm_factor_h
-		ror	XH
-		ror	XL
+run_gov_p_done:	
 		rcall	limit_power
 		movw	sdm_factor_l, XL		; Set throttle
+
 	.endif
 		
 run_calc_loop_end:					; End of the calculations loop
@@ -2092,8 +2144,8 @@ run_calc_loop_end:					; End of the calculations loop
 		sbi	RL_PORT, RL_PIN
 		;sbi	SL_PORT, SL_PIN
 		;sbi	TL_PORT, TL_PIN
-		ldi	XL, low(CLOCK_MHZ*1000000/7000/1000)	; wait 50 ms
-		ldi	XH, high(CLOCK_MHZ*1000000/7000/1000)
+		ldi	XL, low(CLOCK_HZ/7000/1000)	; wait 50 ms
+		ldi	XH, high(CLOCK_HZ/7000/1000)
 		rcall	delay_1000cycles
 fet_test2:	
 		sbi	TH_PORT, TH_PIN
@@ -2155,6 +2207,7 @@ testt:
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; The program execution stars here
 reset:		;rjmp	tstt
+
 		in	IL, MCUCSR			; read reset reason
 		sbi	RL_DDR, RL_PIN			; set fet controlling pins as out
 		sbi	RH_DDR, RH_PIN
@@ -2197,8 +2250,8 @@ reset:		;rjmp	tstt
 	//rjmp	fet_test2
 		led	0, 1
 		led	1, 1
-		ldi	XL, low(CLOCK_MHZ*1000000/20/1000)	; wait 50 ms
-		ldi	XH, high(CLOCK_MHZ*1000000/20/1000)
+		ldi	XL, low(CLOCK_HZ/20/1000)	; wait 50 ms
+		ldi	XH, high(CLOCK_HZ/20/1000)
 		;rcall	delay_1000cycles
 		led	1, 0
 		led	0, 0
@@ -2217,23 +2270,17 @@ reset_clr_lp:	st	X+, YL				; clear ram variables
 		; enable timer interrupts
 		ldi	XL, (1<<TOIE1) | (1<<OCIE1A)
 		out	TIMSK, XL
-
-		; timer2 prescaler 0
-		ldi	XL, 1<<CS20
-		out	TCCR2, XL
 		
 		; timer1, main timer, no prescaler
 		ldi	XL, 1<<CS10
 		out	TCCR1B, XL
 		
-		; timer0, sigma-delta madulator, no prescaler
-		ldi	XL, 1<<CS00			
-		out	TCCR0, XL
+		rcall	sdm_init
 		
 		.if	CONTROL_METHOD == 1
 			rcp_init
 		.elif	CONTROL_METHOD == 2
-			i2c_init
+			i2c_init			; XL, XH, YL clobbered
 		.endif
 
 		; comparator

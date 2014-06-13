@@ -2,15 +2,35 @@
 ; |   Hardware related config    |
 ; *-----------------------------*
 
-; clock frequency [MHz]
-.equ CLOCK_MHZ = 16
+; clock frequency [Hz]
+.equ CLOCK_HZ = 16000000
 
-.equ CONTROL_METHOD = 2					; 1 - RC pulse, 2 - I2C
+; Input signal. 1 - RC pulse, 2 - I2C
+.equ CONTROL_METHOD = 2	
 
-.equ I2C_SLAVE_ADDRESS = 4
+; If I2C chosen as control method
+.equ I2C_SLAVE_ADDRESS = 4				; Base slave address of the ESC
 .equ I2C_PROTOCOL = 2					; 1 - basic, 2 - extended
+.equ I2C_ADDR_PINS = 1					; Does the board have pins shifting the I2C address?
 
-; if rc pulse used
+.if I2C_ADDR_PINS == 1
+
+ .equ I2C_ADDR0_P = PD5
+ .equ I2C_ADDR0_PORT = PORTD
+ .equ I2C_ADDR0_PIN = PIND
+ .equ I2C_ADDR0_DDR = DDRD			
+
+ .equ I2C_ADDR1_P = PD7
+ .equ I2C_ADDR1_PORT = PORTD
+ .equ I2C_ADDR1_PIN = PIND
+ .equ I2C_ADDR1_DDR = DDRD
+
+ .equ I2C_ADDR_PULL_UPS = 1				; Pull-up to Vcc internally?
+
+.endif
+
+
+; If RC Pulse chosen as control method
 .equ RCP_CHANNEL = 0
 
 .equ PWM_SIDE = 1					; which FET side does the PWM; 1 - low, 2 - high
