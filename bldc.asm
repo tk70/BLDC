@@ -148,6 +148,10 @@
 .def DL = r18
 .def DH = r19
 
+; General purpose registers for calculations part only
+.def TL = r14
+.def TH = r15
+
 ; General purpose registers in interrupt code
 .def IL = r4
 .def IH = r5
@@ -238,7 +242,8 @@
 	st_bh:			.byte	1	
 	st_cl:			.byte	1
 	st_ch:			.byte	1
-
+	gov_i_l:		.byte	1
+	gov_i_h:		.byte	1
 	RAM_END:		.byte	1
 
 .cseg
@@ -2009,7 +2014,7 @@ run_thl_set_max_power:
 		; We will be using a PID loop here.
 		;
 		;  P(t)       E(t)   -------------         -------        S(t)
-		;   --->--(X)---->--|  P control  |---->--| Motor |----.----->
+		;   --->--(X)---->--| PID control |---->--| Motor |----.----->
 		;      +   | -       -------------         -------     |
 		;          |             -----------------             |
 		;          *-----<-----< Power <-- Speed  |----<-------*
@@ -2056,27 +2061,24 @@ run_thl_set_max_power:
 		; ---- normal divisionfor now --- optimize
 		ldi	XL, low(GOV_MAX_RPS)		; X := Smax
 		ldi	XH, high(GOV_MAX_RPS)
-		movw	AL, XL
-		movw	XL, BL
+		movw	AL, XL				; Divisor := Smax
+		movw	XL, BL				; Divident := S * Pmax
 		movw	YL, CL
-		clr	BL
-		rcall	div32_24
+		clr	BL				; Clear the 3th byte of the divisor
+		rcall	div32_24			; And divide.
 		movw	BL, XL		
 		rcall	update_power			; Read power signal
 		adiw	XL, 0
-		breq	run_gov_np
+		breq	gov_calc_err
 		ldi	YH, high(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
 		cpi	XL, low(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
 		cpc	XH, YH
 		brsh	PC+3				; 
 		ldi	XL, low(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
 		ldi	XH, high(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
-		sub	XL, BL				; Caluclate E(t)
+gov_calc_err:	sub	XL, BL				; Caluclate E(t)
 		sbc	XH, BH
-		brpl	PC+4
-run_gov_np:	clr	XL
-		clr	XH
-		rjmp	run_gov_e_done
+		movw	TL, XL				; and copy it
 
 /*		; Apply a 1% dead zone on the error value
 		ldi	YH, high(POWER_RANGE/100)
@@ -2091,31 +2093,67 @@ run_gov_np:	clr	XL
 		sbci	XH, high(POWER_RANGE/100)*/
 		
 
-		; --- P segment ---
-run_gov_e_done:	ldi	YL, GOV_P
-		ldi	YH, 0
+		; --- The P (proportional) block ---
+		brpl	PC+3
+		clr	XL				; zeroify the error if negative...
+		clr	XH				; ...since we can't apply negative power to the motor anyway
+		ldi	YL, GOV_P
 		clr	CL
-		clr	CH
 		mul	XL, YL
 		movw	BL, AL				; byte1 (BL) done
 		mul	XH, YL
 		add	BH, AL				; byte2 (BH) done
 		adc	CL, AH
-		mul	YH, XL
-		add	BH, AL
-		adc	CL, AH	
-		adc	CH, CH
-		mul	YH, XH
-		add	CL, AL				; byte3 (CL) done
-		adc	CH, AH				; byte4 (CH) done
-
 		movw	XL, BL
-		movw	YL, CL
-		adiw	YL, 0
-		breq	run_gov_p_done
-run_gov_p_done:	
-		rcall	limit_power
-		movw	sdm_factor_l, XL		; Set throttle
+		breq	PC+3
+		ser	XL				; if went over 2 bytes, set them it to max value
+		ser	XH
+		
+		movw	CL, TL				; Restore E(t) to CL
+		movw	TL, XL				; and save the result of the P block
+
+		; --- The I (integrating) block ---
+		cli					; We have to cli here, the DL register isn't "thread safe"
+		ldi	DL, GOV_I
+		mul	CL, DL				; Multiply the error by I factor
+		movw	XL, AL
+		mulsu	CH, DL				; ...and mulsu wants only r16-r23, so I couldn't use B reg
+		sei
+		clr	BL
+		add	XH, AL
+		adc	BL, AH
+		lds	YL, gov_i_l
+		lds	YH, gov_i_h
+		add	YL, XH				; Increment the integrator buffer, skip the youngest byte
+		adc	YH, BL				; dividing the result by 256
+		
+/*		ldi	CL, high(POWER_RANGE)		; Anti wind-up: upper bound
+		cpi	YL, low(POWER_RANGE)
+		cpc	YH, CL
+		brlo	PC+3
+		ldi	YL, low(POWER_RANGE)
+		ldi	YH, high(POWER_RANGE)
+
+		ldi	CL, high(-POWER_RANGE)		; Anti wind-up: lower bound
+		cpi	YL, low(-POWER_RANGE)
+		cpc	YH, CL
+		brsh	PC+3
+		ldi	YL, low(-POWER_RANGE)
+		ldi	YH, high(-POWER_RANGE)*/
+
+		sts	gov_i_l, YL			; Store the integrator buffer
+		sts	gov_i_h, YH
+
+		; Sum the results of the P, I and D {coming soon} blocks
+		movw	XL, TL				; Restore the P block result to X
+		add	XL, YL				; Add I block result to it
+		adc	XH, YH
+		brpl	PC+3
+		clr	XL				; Since we can't apply negative power to the motor, just zero it
+		clr	XH
+
+		rcall	limit_power			; Make sure it's in allowed range
+		movw	sdm_factor_l, XL		; and set the throttle.
 
 	.endif
 		
@@ -2201,7 +2239,23 @@ testt:
 		clr	CL
 		clr	CH
 		movw	XL, CL
-		nop*/
+		nop
+.equ k = -255
+.equ l = 5
+tstt:
+		ldi	YH, low(k*l)
+		ldi	ZL, high(k*l)
+		ldi	ZH, byte3(k*l)
+		ldi	CL, low(k)
+		ldi	CH, high(k)
+		ldi	DL, l
+		clr	YL
+		mul	CL, DL
+		movw	XL, AL
+		mulsu	CH, DL
+		add	XH, AL
+		adc	YL, AH
+		ret*/
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; |                                                       Main                                                        |
 ; *-------------------------------------------------------------------------------------------------------------------*
