@@ -26,16 +26,10 @@
 .equ TICKS_PER_MS = CLOCK_HZ / TIMER_PRESCALER / 1000
 .equ TICKS_PER_SEC = CLOCK_HZ / TIMER_PRESCALER
 
-.equ COM_T_RPM_MIN = 1000000*10*TICKS_PER_US/MIN_RPM
 .equ COM_T_RPM_MAX = 1000000*10*TICKS_PER_US/MAX_RPM
-.equ MIN_RPS = MIN_RPM / 60
 .equ MAX_RPS = MAX_RPM / 60
 .equ GOV_MAX_RPS = GOVERNOR_MAX_RPM / 60
 .equ GOV_MIN_RPS = GOVERNOR_MIN_RPM / 60
-
-.equ SDM_FREQUENCY = 100000
-
-
 
 .if CONTROL_METHOD == 1
 	; If we chose RC pulse as control method
@@ -67,6 +61,11 @@
 	.else
 		.equ POWER_RANGE = 2047			; 11 bit power resolution
 	.endif
+.endif
+
+.if POWER_RANGE > 0xEFFE
+	.error "Power range 15 bit overflow"
+	.exit
 .endif
 
 .equ ST_CONST = THROTTLE_PERCENT_PER_1K_RPM * POWER_RANGE * 256 * 6 / 10000
@@ -102,6 +101,12 @@
 .elif SDM_CYCLE_TIME < 50
 	.error	"Selected SDM frequency is too high"
 	.exit
+.endif
+
+.if POWER_RANGE/200 == 0
+	.equ GOV_DZ_RNG = 1
+.else
+	.equ GOV_DZ_RNG = POWER_RANGE/200
 .endif
 
 ; Beeper on state in one cycle time [us]
@@ -353,6 +358,78 @@ stloop:		nop
 		.endif
 .endmacro
 
+; 32bit/24bit division
+div32_24:	clr	CH
+d3224_10:	tst	BL
+		breq	d3224_20
+		ldi	CL, 16
+d3224_11:	lsl	XL
+		rol	XH
+		rol	YL
+		rol	YH
+		rol	CH
+		brcs	d3224_12
+		cp	YL, AL
+		cpc	YH, AH
+		cpc	CH, BL
+		brcs	d3224_13
+d3224_12:	sub	YL, AL
+		sbc	YH, AH
+		sbc	CH, BL
+		inc	XL
+d3224_13:	dec	CL
+		brne	d3224_11
+		mov	AL, YL
+		clr	YL
+		mov	AH, YH
+		clr	YH
+		mov	BL, CH
+		ret
+d3224_20:	tst	AH
+		breq	d3224_30
+		ldi	CL, 24
+d3224_21:	lsl	XL
+		rol	XH
+		rol	YL
+		rol	YH
+		rol	CH
+		brcs	d3224_22
+		cp	YH, AL
+		cpc	CH, AH
+		brcs	d3224_23
+d3224_22:	sub	YH, AL
+		sbc	CH, AH
+		inc	XL
+d3224_23:	dec	CL
+		brne	d3224_21
+		mov	AL, YH
+		clr	YH
+		mov	AH, CH
+		ret
+d3224_30:	ldi	CL, 32
+d3224_31:	lsl	XL
+		rol	XH
+		rol	YL
+		rol	YH
+		rol	CH
+		brcs	d3224_32
+		cp	CH, AL
+		brcs	d3224_33
+d3224_32:	sub	CH, AL
+		inc	XL
+d3224_33:	dec	CL
+		brne	d3224_31
+		mov	AL, CH				; store remainder
+		ret
+.macro addiw
+	.if @1 > 63
+		subi	@0, low(-@1)
+		sbci	@0, high(-@1)
+	.else
+		adiw	@0, @1
+	.endif
+.endmacro
+
 ; *-------------------------------------------------------------------------------------------------------------------*
 ; |                                                     Timer                                                         |
 ; *-------------------------------------------------------------------------------------------------------------------*
@@ -555,71 +632,6 @@ d1000c_loop:	dec	XL
 		pop	XL				; 2
 		sbiw	XL, 1				; 2
 		brpl	delay_1000cycles		; 2
-		ret
-
-
-; 32bit/24bit division
-div32_24:	clr	CH
-d3224_10:	tst	BL
-		breq	d3224_20
-		ldi	CL, 16
-d3224_11:	lsl	XL
-		rol	XH
-		rol	YL
-		rol	YH
-		rol	CH
-		brcs	d3224_12
-		cp	YL, AL
-		cpc	YH, AH
-		cpc	CH, BL
-		brcs	d3224_13
-d3224_12:	sub	YL, AL
-		sbc	YH, AH
-		sbc	CH, BL
-		inc	XL
-d3224_13:	dec	CL
-		brne	d3224_11
-		mov	AL, YL
-		clr	YL
-		mov	AH, YH
-		clr	YH
-		mov	BL, CH
-		ret
-d3224_20:	tst	AH
-		breq	d3224_30
-		ldi	CL, 24
-d3224_21:	lsl	XL
-		rol	XH
-		rol	YL
-		rol	YH
-		rol	CH
-		brcs	d3224_22
-		cp	YH, AL
-		cpc	CH, AH
-		brcs	d3224_23
-d3224_22:	sub	YH, AL
-		sbc	CH, AH
-		inc	XL
-d3224_23:	dec	CL
-		brne	d3224_21
-		mov	AL, YH
-		clr	YH
-		mov	AH, CH
-		ret
-d3224_30:	ldi	CL, 32
-d3224_31:	lsl	XL
-		rol	XH
-		rol	YL
-		rol	YH
-		rol	CH
-		brcs	d3224_32
-		cp	CH, AL
-		brcs	d3224_33
-d3224_32:	sub	CH, AL
-		inc	XL
-d3224_33:	dec	CL
-		brne	d3224_31
-		mov	AL, CH				; store remainder
 		ret
 
 ; *-------------------------------------------------------------------------------------------------------------------*
@@ -1686,6 +1698,8 @@ running_mode_switch:
 		sts	timing_angle, XL
 		cbr	flags, 1<<STARTUP
 		sbr	flags, 1<<RUN
+		sts	gov_i_l, XL
+		sts	gov_i_h, XL
 		rcall	update_power
 		rcall	limit_power
 		
@@ -2078,20 +2092,25 @@ run_thl_set_max_power:
 		ldi	XH, high(GOV_MIN_RPS*POWER_RANGE/GOV_MAX_RPS)
 gov_calc_err:	sub	XL, BL				; Caluclate E(t)
 		sbc	XH, BH
-		movw	TL, XL				; and copy it
 
-/*		; Apply a 1% dead zone on the error value
-		ldi	YH, high(POWER_RANGE/100)
-		cpi	XL, low(POWER_RANGE/100)
-		cpc	XH, YH
-		brsh	PC+4
+		; Apply a 0.5% dead zone on the error value
+		; The P segment amplifies the noises and thus the motor, thanks to SMD, makes ugly sounds.
+		; We prevent that by setting the error value (E(t)) to 0 when it's atually close to 0 (0.5%).
+		tst	XH
+		brmi	gov_neg_err
+gov_pos_err:	addiw	XL, lwrd(-GOV_DZ_RNG)
+		brpl	gov_dz_done
 		clr	XL
 		clr	XH
-		rjmp	run_gov_e_done
+		rjmp	gov_dz_done
 
-		subi	XL, low(POWER_RANGE/100)
-		sbci	XH, high(POWER_RANGE/100)*/
-		
+gov_neg_err:	addiw	XL, GOV_DZ_RNG
+		brmi	gov_dz_done
+		clr	XL
+		clr	XH
+gov_dz_done:
+
+		movw	TL, XL				; Store a copy of E(t)
 
 		; --- The P (proportional) block ---
 		brpl	PC+3
@@ -2114,7 +2133,7 @@ gov_calc_err:	sub	XL, BL				; Caluclate E(t)
 
 		; --- The I (integrating) block ---
 		cli					; We have to cli here, the DL register isn't "thread safe"
-		ldi	DL, GOV_I
+		ldi	DL, GOV_I*255/100
 		mul	CL, DL				; Multiply the error by I factor
 		movw	XL, AL
 		mulsu	CH, DL				; ...and mulsu wants only r16-r23, so I couldn't use B reg
@@ -2127,20 +2146,22 @@ gov_calc_err:	sub	XL, BL				; Caluclate E(t)
 		add	YL, XH				; Increment the integrator buffer, skip the youngest byte
 		adc	YH, BL				; dividing the result by 256
 		
-/*		ldi	CL, high(POWER_RANGE)		; Anti wind-up: upper bound
-		cpi	YL, low(POWER_RANGE)
+		// Intergator anti wind-up
+gov_aw_ub:	ldi	CL, high(POWER_RANGE*AW_RNG/100); Upper bound
+		cpi	YL, low(POWER_RANGE*AW_RNG/100)
 		cpc	YH, CL
-		brlo	PC+3
-		ldi	YL, low(POWER_RANGE)
-		ldi	YH, high(POWER_RANGE)
+		brlt	gov_aw_lb
+		ldi	YL, low(POWER_RANGE*AW_RNG/100)
+		ldi	YH, high(POWER_RANGE*AW_RNG/100)
+		rjmp	gov_aw_done
 
-		ldi	CL, high(-POWER_RANGE)		; Anti wind-up: lower bound
-		cpi	YL, low(-POWER_RANGE)
+gov_aw_lb:	ldi	CL, high(-POWER_RANGE*AW_RNG/100); Lower bound
+		cpi	YL, low(-POWER_RANGE*AW_RNG/100)
 		cpc	YH, CL
-		brsh	PC+3
-		ldi	YL, low(-POWER_RANGE)
-		ldi	YH, high(-POWER_RANGE)*/
-
+		brge	gov_aw_done
+		ldi	YL, low(-POWER_RANGE*AW_RNG/100)
+		ldi	YH, high(-POWER_RANGE*AW_RNG/100)
+gov_aw_done:
 		sts	gov_i_l, YL			; Store the integrator buffer
 		sts	gov_i_h, YH
 
